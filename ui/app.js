@@ -382,7 +382,7 @@ const Scout = {
     const status = document.getElementById('scan-status');
     if (status && !this.scanRunning) {
       status.textContent = activeRun
-        ? `${activeRun.label || 'Scan in progress'}${activeRun.assessment?.totalBatches ? ` · batch ${activeRun.assessment.currentBatch} of ${activeRun.assessment.totalBatchesExact ? '' : 'at least '}${activeRun.assessment.totalBatches}` : ''}`
+        ? `${this.scanProgressText(activeRun)}${activeRun.assessment?.totalBatches ? ` · batch ${activeRun.assessment.currentBatch} of ${activeRun.assessment.totalBatchesExact ? '' : 'at least '}${activeRun.assessment.totalBatches}` : ''}`
         : queuedCount
         ? `${queuedCount} queued ${queuedCount === 1 ? 'request' : 'requests'}`
         : h?.lastRunAt
@@ -444,16 +444,37 @@ const Scout = {
         remaining = lowMinutes < 1 ? `about ${highMinutes} min or less remaining` : `about ${lowMinutes}–${highMinutes} min remaining`;
       }
     }
-    status.textContent = operation.status === 'failed'
+    status.textContent = operation.result?.status === 'queued'
+      ? 'Scan request queued — waiting for its turn.'
+      : operation.status === 'failed'
       ? `Scan needs attention: ${operation.error || 'unknown error'}`
       : operation.status === 'succeeded' ? 'Scan completed — refreshing results…'
         : `${operation.phase || 'Scout is searching'} · ${step} · ${elapsed}${remaining ? ` · ${remaining}` : ''}`;
+  },
+
+  scanProgressText(run) {
+    return run?.owner ? (run.label || 'Scan in progress') : 'Scan paused — no active worker';
   },
 
   discardBreakdown(scan = this.latestScan || this.state.data?.scanHealth) {
     const labels = { hard_exclusion: 'hard exclusions', mandatory_unmet: 'mandatory gates', below_threshold: 'below threshold', provider_discarded: 'assessment discards' };
     return Object.entries(scan?.discarded || {}).filter(([, count]) => Number(count) > 0)
       .map(([key, count]) => `${count} ${labels[key] || key.replaceAll('_', ' ')}`).join(', ');
+  },
+
+  advertLivenessDisclosure(scan) {
+    const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 10_000 ? value : null;
+    const checked = count(scan?.advertsChecked);
+    const unverified = count(scan?.advertsUnverified);
+    const closed = count(scan?.advertsClosed);
+    const hasCounts = checked !== null || unverified !== null || closed !== null;
+    const summary = hasCounts
+      ? `<p class="meta">Advert link checks attempted: ${this.esc(checked ?? 'unknown')}. ${this.esc(unverified ?? 0)} unverified · ${this.esc(closed ?? 0)} confirmed closed. An attempted check does not confirm current availability.</p>`
+      : '';
+    const warning = unverified > 0
+      ? `<div class="setup-callout"><strong>Advert availability could not be verified for ${this.esc(unverified)} links. Open the source advert before applying.</strong></div>`
+      : '';
+    return summary + warning;
   },
 
   latestScanCard() {
@@ -464,6 +485,7 @@ const Scout = {
     return `${audit}<div class="card scan-result-card">
       <div class="top"><b>Latest scan result</b><span class="chip">${this.esc(scan.degraded ? 'degraded' : 'complete')}</span></div>
       <p><strong>${this.esc(scan.funnel?.assessed ?? scan.candidatesFound)} assessed, ${this.esc(scan.keepersAdded)} kept</strong>${this.discardBreakdown(scan) ? ` — ${this.esc(this.discardBreakdown(scan))}` : ''}${this.esc(broadened)}.</p>
+      ${this.advertLivenessDisclosure(scan)}
       <p class="meta">Zero keepers can be a valid result: Scout keeps approved gates in force even when it broadens discovery.</p>
       <div class="controls"><button class="act" data-action="open-scan-result">Review this scan</button>${scan.reportDate ? `<button class="act" data-action="open-scan-report" data-date="${this.esc(scan.reportDate)}">Open dated report</button>` : ''}</div>
     </div>`;
@@ -486,9 +508,13 @@ const Scout = {
     const recoveryText = `${recoveries} ${recoveries === 1 ? 'recovery' : 'recoveries'}`;
     const queueText = `${queued.length} queued ${queued.length === 1 ? 'request' : 'requests'}`;
     const terminal = run?.terminalReason ? ` · ${this.esc(run.terminalReason)}` : '';
+    const incomplete = run && !['complete', 'partial', 'abandoned', 'failed'].includes(run.state);
+    const runLabel = incomplete && !run.owner
+      ? 'Scan paused — no active worker'
+      : (run?.label || run?.state);
     return `<div class="card scan-run-audit">
       <div class="top"><b>Durable scan state</b><span class="chip">${this.esc(run?.state || 'queued')}</span></div>
-      ${run ? `<p><strong>${this.esc(run.label || run.state)}</strong>${batch}${terminal}</p>
+      ${run ? `<p><strong>${this.esc(runLabel)}</strong>${batch}${terminal}</p>
         <div class="meta">run ${this.esc(run.id)} · ${this.esc(run.owner || 'inactive worker')} · ${this.esc(recoveryText)}</div>` : ''}
       <div class="meta">${this.esc(queueText)}</div>
     </div>`;
@@ -577,6 +603,7 @@ const Scout = {
         throw new Error('durable scan state is invalid');
       }
       if (!durableRuns.runs.every((run) => DURABLE_RUN_STATES.has(run?.state))
+        || !durableRuns.runs.every((run) => run.owner === null || run.owner === 'active worker')
         || durableRuns.state !== (durableRuns.runs[0]?.state || 'waiting')
         || !durableQueue.requests.every(
           (request) => ACTIVE_QUEUE_STATES.has(request?.status)
@@ -588,12 +615,9 @@ const Scout = {
         throw new Error('durable scan state is invalid');
       }
       const activeRun = durableRuns.runs.some(
-        (run) => !TERMINAL_RUN_STATES.has(run.state),
+        (run) => !TERMINAL_RUN_STATES.has(run.state) && run.owner === 'active worker',
       );
-      const queued = durableQueue.requests.some(
-        (request) => ACTIVE_QUEUE_STATES.has(request.status),
-      );
-      if (activeRun || queued) {
+      if (activeRun) {
         this.scanRunning = true;
         if (button) { button.disabled = true; button.textContent = 'Scanning…'; }
         await this.loadOpportunities({ durableRuns, durableQueue });
@@ -769,10 +793,26 @@ const Scout = {
     bits.push(this.categoryOf(e));
     const commute = this.commuteLine(e);
     if (commute) bits.push(commute);
+    const assessmentScore = this.assessmentScoreDisclosure(e);
+    if (assessmentScore) bits.push(assessmentScore);
     const current = this.currentStage(e);
     if (current) bits.push(`current: ${current}`);
     const checked = e.lastChecked ? ` - checked ${this.esc(e.lastChecked)}` : '';
     return this.esc(bits.join(' - ')) + checked;
+  },
+
+  assessmentScoreDisclosure(entry) {
+    if (entry?.scoreBasis !== 'assessment-band') return '';
+    const score = Number(entry.score);
+    const { actionScore, checkScore } = this.triagePolicy();
+    const band = Number.isFinite(score) && score >= actionScore
+      ? 'Action'
+      : Number.isFinite(score) && score >= checkScore ? 'Check' : 'Below check';
+    const discoveryScore = entry.discoveryScore;
+    const discovery = typeof discoveryScore === 'number' && Number.isFinite(discoveryScore)
+      ? `; discovery relevance: ${discoveryScore}`
+      : '';
+    return `Assessment band: ${band}${discovery}`;
   },
 
   tagHtml(e) {
@@ -835,7 +875,8 @@ const Scout = {
     this.workspaceConfig = config || null;
     const commute = config?.commute;
     if (commute) {
-      if (['either', 'car', 'public', 'any'].includes(commute.mode)) this.state.commute.mode = commute.mode;
+      const mode = commute.mode === 'public transport' ? 'public' : commute.mode;
+      if (['either', 'car', 'public', 'any'].includes(mode)) this.state.commute.mode = mode;
       if (Number.isFinite(Number(commute.maxMinutes))) this.state.commute.maxMinutes = String(commute.maxMinutes);
       if (typeof commute.includeUnknown === 'boolean') this.state.commute.includeUnknown = commute.includeUnknown;
     }
@@ -1045,10 +1086,16 @@ const Scout = {
     };
     const reasonText = (code) => reasonLabels[code]
       || String(code || 'not-selected').replaceAll('-', ' ').replace(/^./, (letter) => letter.toUpperCase());
+    const assessmentBandRows = (scan.reviewed || []).filter(
+      (item) => item?.scoreBasis === 'assessment-band',
+    );
+    const scoreExplanation = assessmentBandRows.length
+      ? '<div class="setup-callout"><strong>Assessment band markers are not percentage fit scores.</strong><p>Discovery relevance is a separate signal and is shown separately for each reviewed role.</p></div>'
+      : '';
     const groups = Object.entries(labels).map(([outcome, label]) => {
       const items = (scan.reviewed || []).filter((item) => item.outcome === outcome).sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
       if (!items.length) return '';
-      return `<details ${outcome !== 'kept' ? 'open' : ''}><summary>${this.esc(label)} (${items.length})</summary><div class="scan-review-list">${items.map((item) => `<article class="scan-review-item"><div><b>${this.esc(item.company)} — ${this.esc(item.role)}</b><span class="chip">${this.esc(item.score ?? '—')}</span></div><p>${this.esc((item.reasons || []).join('; ') || label)}</p>${item.sourceUrl ? `<a href="${this.safeHref(item.sourceUrl)}" target="_blank" rel="noopener">View source ↗</a>` : ''}</article>`).join('')}</div></details>`;
+      return `<details ${outcome !== 'kept' ? 'open' : ''}><summary>${this.esc(label)} (${items.length})</summary><div class="scan-review-list">${items.map((item) => `<article class="scan-review-item"><div><b>${this.esc(item.company)} — ${this.esc(item.role)}</b><span class="chip">${this.esc(item.score ?? '—')}</span></div>${this.assessmentScoreDisclosure(item) ? `<p class="meta">${this.esc(this.assessmentScoreDisclosure(item))}</p>` : ''}<p>${this.esc((item.reasons || []).join('; ') || label)}</p>${item.sourceUrl ? `<a href="${this.safeHref(item.sourceUrl)}" target="_blank" rel="noopener">View source ↗</a>` : ''}</article>`).join('')}</div></details>`;
     }).join('');
     const coverageSources = (scan.coverage?.source || []).map((item) => (
       `<article class="scan-review-item"><div><b>${this.esc(item.value)}</b><span class="chip">${this.esc(item.assessed)} assessed</span></div><p>${this.esc(`${item.found} found · ${item.ranked} ranked · ${item.selected} selected · ${item.excluded} excluded`)}</p></article>`
@@ -1076,6 +1123,8 @@ const Scout = {
     const overlay = document.getElementById('scan-result-overlay');
     document.getElementById('scan-result-body').innerHTML = `
       <p><strong>${this.esc(scan.funnel?.assessed ?? scan.candidatesFound)} assessed, ${this.esc(scan.keepersAdded)} kept</strong>${this.discardBreakdown(scan) ? ` — ${this.esc(this.discardBreakdown(scan))}` : ''}.</p>
+      ${this.advertLivenessDisclosure(scan)}
+      ${scoreExplanation}
       ${scan.automaticBroadened ? '<div class="setup-callout"><strong>Discovery widened automatically</strong><p>Scout ran one broader query pass but kept every approved salary, location, commute, exclusion and evidence gate.</p></div>' : ''}
       ${coverage}
       ${coverageDimensions}
@@ -1250,6 +1299,7 @@ const Scout = {
       .filter((k) => k in bd)
       .map((k) => `<div class="meta">${k} <span style="width:${(bd[k] || 0) * 6}px"></span> ${bd[k]}</div>`)
       .join('');
+    const assessmentScore = this.assessmentScoreDisclosure(e);
     const tags = (e.tags || []).length
       ? `<div class="chip-list">${(e.tags || []).map((t) => `<span class="chip">${this.esc(t)}</span>`).join('')}</div>`
       : '';
@@ -1291,7 +1341,7 @@ const Scout = {
       : '';
     return `
       ${sourcePanel}
-      <div class="label">score breakdown (read-only)</div>${bars || '<div class="meta">not scored yet</div>'}
+      <div class="label">score breakdown (read-only)</div>${assessmentScore ? `<div class="meta">${this.esc(assessmentScore)}. Assessment band markers are not percentage fit scores.</div>` : ''}${bars || '<div class="meta">not scored yet</div>'}
       <div class="label">tags</div>${tags || '<div class="meta">-</div>'}
       <div class="label">category</div><div class="meta">${this.esc(this.categoryOf(e))}</div>
       <div class="label">commute</div>${commuteHtml}

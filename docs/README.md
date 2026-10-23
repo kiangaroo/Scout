@@ -31,6 +31,7 @@ The [canonical VPS state and automatic backup guide](VPS_BACKUP_AND_STATE.md) co
 - [Scheduled scans](AUTOMATION.md)
 - [Upgrades and rollback](UPGRADES.md)
 - [Known issues](KNOWN_ISSUES.md)
+- [Unreleased changes](CHANGES.md)
 - [CV quality guidance](CV_QUALITY.md)
 
 ## I want to contribute

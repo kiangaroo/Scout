@@ -17,6 +17,7 @@ import {
   openRunJournal,
   validateRunJournal,
 } from './runJournal.mjs';
+import { loadRecoverablePreparedFinalisation } from './mutationCoordinator.mjs';
 import {
   assertCurrentFence,
   assertScanLeaseScope,
@@ -783,14 +784,16 @@ export function recoverRun(root, targetRunId, lease, selectedDecision) {
   if (!manifest.compatibility?.schemaVersion) {
     return failRecovery(root, targetRunId, lease, 'compatibility-missing', requestFingerprint, 'run has no supported recovery compatibility contract');
   }
-  if (TERMINAL_OUTCOMES.has(manifest.outcome)) {
+  const recoverablePreparedFinalisation = manifest.outcome === 'failed'
+    && loadRecoverablePreparedFinalisation(run) !== null;
+  if (TERMINAL_OUTCOMES.has(manifest.outcome) && !recoverablePreparedFinalisation) {
     throw new Error(`terminal ${manifest.outcome} run is immutable and cannot be recovered`);
   }
 
   const candidate = {
     runId: targetRunId,
     updatedAt: run.events.at(-1).recordedAt,
-    outcome: manifest.outcome,
+    outcome: recoverablePreparedFinalisation ? 'in-progress' : manifest.outcome,
     compatibility: manifest.compatibility,
     completedWork: manifest.completedWork,
   };

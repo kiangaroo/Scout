@@ -155,6 +155,54 @@ test('configured triage thresholds drive score presentation', () => {
   assert.equal(scout.fitClass(63), 'fit-weak');
 });
 
+test('assessment-band entries disclose fixed bands and separate discovery relevance', () => {
+  const { scout, context } = loadScout();
+  const entry = {
+    score: 70, scoreBasis: 'assessment-band', discoveryScore: 24.13,
+    scoreBreakdown: { 'assessment-band': 70, 'mandatory-adjustment': 0 },
+  };
+  assert.match(scout.metaLine(entry), /Assessment band: Action; discovery relevance: 24\.13/);
+  assert.match(scout.assessmentScoreDisclosure({ score: 55, scoreBasis: 'assessment-band', discoveryScore: 82 }), /Assessment band: Check; discovery relevance: 82/);
+  scout.workspaceConfig = { triage: { actionScore: 82, checkScore: 64 } };
+  assert.match(scout.assessmentScoreDisclosure({ score: 70, scoreBasis: 'assessment-band' }), /Assessment band: Check/);
+  assert.match(scout.assessmentScoreDisclosure({ score: 60, scoreBasis: 'assessment-band' }), /Assessment band: Below check/);
+  assert.match(scout.detailHtml(entry), /Assessment band markers are not percentage fit scores/);
+  assert.match(scout.detailHtml(entry), /Discovery relevance: 24\.13/i);
+  assert.doesNotMatch(scout.metaLine({ score: 72, scoreBreakdown: { technical: 4 } }), /Assessment band|discovery relevance/i);
+
+  const body = { innerHTML: '' };
+  const overlay = { classList: { remove() {} } };
+  context.document.getElementById = (id) => id === 'scan-result-body' ? body : overlay;
+  context.requestAnimationFrame = () => {};
+  scout.latestScan = {
+    reviewed: [{ company: 'Synthetic', role: 'Engineer', outcome: 'kept', score: 70,
+      scoreBasis: 'assessment-band', discoveryScore: 24.13, reasons: [] }],
+    coverage: {}, explanations: [],
+    funnel: { assessed: 1 }, keepersAdded: 1,
+    runAt: '2026-10-23T10:00:00Z', advertsChecked: 60, advertsUnverified: 12, advertsClosed: 2,
+  };
+  scout.state.data = { opportunities: [] };
+  return scout.openScanResult().then(() => {
+    assert.match(body.innerHTML, /Assessment band markers are not percentage fit scores/);
+    assert.match(body.innerHTML, /Assessment band: Check; discovery relevance: 24\.13/);
+    assert.match(body.innerHTML, /Advert availability could not be verified for 12 links\. Open the source advert before applying\./);
+  });
+});
+
+test('latest scan card explains that advert checks are attempts and warns about unverified links', () => {
+  const { scout } = loadScout();
+  scout.scanRuns = [];
+  scout.scanQueue = { requests: [] };
+  scout.scanRunState = 'waiting';
+  scout.latestScan = {
+    runAt: '2026-10-23T10:00:00Z', funnel: { assessed: 60 }, keepersAdded: 28,
+    advertsChecked: 60, advertsUnverified: 12, advertsClosed: 2,
+  };
+  const html = scout.latestScanCard();
+  assert.match(html, /Advert link checks attempted: 60/);
+  assert.match(html, /Advert availability could not be verified for 12 links\. Open the source advert before applying\./);
+});
+
 test('Codex task controls escape fallback identity and never call a click success', () => {
   const { scout } = loadScout();
   scout.chat = {
@@ -449,6 +497,27 @@ test('run audit renders persisted recovery and queue state without private diagn
   assert.doesNotMatch(html, /PRIVATE-HOST|4242|private prompt|full advert body|private queued prompt/i);
 });
 
+test('run audit labels inactive incomplete scans as paused without promising recovery', () => {
+  const { scout } = loadScout();
+  scout.scanRuns = [{
+    id: 'run-1234…', state: 'collecting', label: 'Collecting vacancies', owner: null,
+    recoveryCount: 0, assessment: null,
+  }];
+  scout.scanQueue = { requests: [] };
+  assert.match(scout.scanRunAuditCard(), /Scan paused — no active worker/);
+});
+
+test('queued scan operations and inactive run progress are described honestly', () => {
+  const { scout, context } = loadScout();
+  const status = { textContent: '' };
+  context.document.getElementById = (id) => id === 'scan-status' ? status : null;
+  scout.showOperation({ type: 'scan', status: 'succeeded', result: { status: 'queued' } });
+  assert.match(status.textContent, /scan request queued/i);
+  assert.doesNotMatch(status.textContent, /scan completed/i);
+  assert.match(scout.scanProgressText({ label: 'Collecting vacancies', owner: null }), /Scan paused — no active worker/);
+  assert.match(scout.scanProgressText({ label: 'Collecting vacancies', owner: 'active worker' }), /Collecting vacancies/);
+});
+
 test('the Jobs audit remains visible for queue-only and waiting workspaces', () => {
   const { scout } = loadScout();
   scout.latestScan = null;
@@ -461,6 +530,56 @@ test('the Jobs audit remains visible for queue-only and waiting workspaces', () 
   assert.match(scout.latestScanCard(), /1 queued request/i);
   scout.scanQueue = { state: 'waiting', requests: [] };
   assert.match(scout.latestScanCard(), /Waiting to scan/i);
+});
+
+test('restart reconciliation lets an explicit scan recover stale durable claims', async () => {
+  const { scout, context } = loadScout();
+  const { doc } = withJobsDom();
+  context.document = doc;
+  let pollScheduled = false;
+  context.fetch = async () => ({ ok: true, json: async () => ({}) });
+  context.setTimeout = () => { pollScheduled = true; return 1; };
+  scout.api = async (route) => route === '/api/scan/runs'
+    ? { state: 'collecting', runs: [{ state: 'collecting', owner: null }] }
+    : { state: 'waiting', requests: [{ status: 'claimed', runId: 'run-old' }] };
+  scout.loadOpportunities = async () => {};
+
+  await scout.reattachScanOperation({ reconcileMissing: true });
+
+  assert.equal(scout.scanRunning, false);
+  assert.equal(doc.getElementById('scan-now').disabled, false);
+  assert.equal(doc.getElementById('scan-now').textContent, 'Scan now');
+  assert.equal(pollScheduled, false);
+});
+
+test('restart reconciliation keeps a live worker fenced and fails closed on unknown ownership', async () => {
+  for (const owner of ['active worker', 'unexpected']) {
+    const { scout, context } = loadScout();
+    const { doc } = withJobsDom();
+    context.document = doc;
+    let pollScheduled = false;
+    context.fetch = async () => ({ ok: true, json: async () => ({}) });
+    context.setTimeout = () => { pollScheduled = true; return 1; };
+    scout.api = async (route) => route === '/api/scan/runs'
+      ? { state: 'collecting', runs: [{ state: 'collecting', owner }] }
+      : { state: 'waiting', requests: [] };
+    scout.loadOpportunities = async () => {};
+
+    await scout.reattachScanOperation({ reconcileMissing: true });
+
+    assert.equal(scout.scanRunning, true);
+    assert.equal(doc.getElementById('scan-now').disabled, true);
+    assert.equal(pollScheduled, true);
+  }
+});
+
+test('commute public transport config selects the public filter without changing stored config', () => {
+  const { scout } = loadScout();
+  const config = { commute: { mode: 'public transport', maxMinutes: 35, includeUnknown: true } };
+  scout.applyWorkspaceConfig(config, { render: false });
+  assert.equal(scout.state.commute.mode, 'public');
+  assert.equal(config.commute.mode, 'public transport');
+  assert.equal(scout.workspaceConfig, config);
 });
 
 test('renderJobs lists only new jobs, highest score first, with tags and actions', () => {

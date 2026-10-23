@@ -21,6 +21,11 @@ Without credentials this command reports Adzuna unavailable and Scout can contin
 
 ## ATS and public discovery
 
+Adzuna supplies description snippets rather than full adverts. Its predicted
+salary values are labelled as estimated and retain that certainty for ranking;
+missing or unrecognised prediction flags leave certainty unknown. These values
+do not establish take-home pay. Verify pay and duties against the full advert.
+
 Employer monitoring lives in `data/employers.json`; legacy ATS portal
 configuration in `data/ats-portals.json` is migrated into that reviewable
 registry and is not collected a second time. Source notes live in

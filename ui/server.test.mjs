@@ -15,6 +15,8 @@ const {
   APP_ROOT, APP_VERSION, UI_BUILD_FILES, UI_BUILD_ID, WORKSPACE_ROOT,
   canAutoDownloadUpdate, checkStartupProviderHealth, confirmProviderLoginHealth, createRuntimeProviderHealthMonitor,
   closeServerSafely, codexDeepLinkDetection, computeUiBuildId, createServer,
+  resolveManualScanModel,
+  queuedManualScanResult,
   inspectCodexDeepLinkHandler, operations, providerDetection, providerLoginControl,
   publicApiError, publicCvImportError, publicDeviceSettings, publicProviderStatus,
   publicSetupConfigError, recoverProfilePublicationsAtStartup, requestAccess,
@@ -1546,6 +1548,25 @@ test('supervised scan requires a configured provider', async () => {
   assert.match(JSON.parse(response.text).error, /provider/i);
 });
 
+test('manual scan model defaults follow provider configuration while explicit null stays default', () => {
+  const config = { ai: {
+    provider: 'codex', model: 'legacy-default',
+    models: { codex: 'codex-choice', claude: 'claude-choice' },
+  } };
+  assert.equal(resolveManualScanModel(config, 'codex', {}), 'codex-choice');
+  assert.equal(resolveManualScanModel(config, 'claude', {}), 'claude-choice');
+  assert.equal(resolveManualScanModel(config, 'codex', { model: null }), null);
+  assert.equal(resolveManualScanModel(config, 'codex', { model: 'request-choice' }), 'request-choice');
+  assert.equal(resolveManualScanModel({ ai: { provider: 'codex', model: 'legacy-default' } }, 'codex', {}), 'legacy-default');
+});
+
+test('queued scan outcomes remain successful queue acknowledgements', () => {
+  assert.deepEqual(queuedManualScanResult({ ok: false, status: 'queued', runId: 'run-123' }), {
+    ok: true, status: 'queued', runId: 'run-123',
+  });
+  assert.equal(queuedManualScanResult({ ok: false, status: 'skipped' }), null);
+});
+
 test('daily schedule is blocked before a healthy supervised scan', async () => {
   const host = `127.0.0.1:${port}`;
   const response = await request({ method: 'POST', path: '/api/schedule', headers: { host, origin: `http://${host}`, 'content-type': 'application/json' }, body: JSON.stringify({ action: 'install', provider: 'codex', time: '07:30' }) });
@@ -1609,18 +1630,39 @@ test('latest scan API exposes only bounded review fields and scan health omits r
   fs.writeFileSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), `${JSON.stringify({
     schemaVersion: 3, timestamp: '2026-07-22T10:00:00.000Z', started_at: '2026-07-22T09:53:00.000Z',
     agent: 'codex', mode: 'primary', degraded: false, skipped: false, candidates_found: 1, keepers_added: 0, keepers_updated: 0,
+    adverts_checked: 60, adverts_unverified: 12, adverts_closed: 2,
     discarded: { provider_discarded: 1 }, errors: [], source_health: {}, queries_checked: ['private query'],
     reviewed: [{
       company: 'Synthetic Company', role: 'Synthetic Role', source: 'synthetic', sourceUrl: 'https://example.test/job',
       outcome: 'provider_discarded', score: 45, reasons: ['Concise reason'], description: 'full advert',
+      scoreBasis: 'assessment-band', discoveryScore: 24.13,
       profileEvidence: 'private evidence', prompt: 'provider prompt',
+    }, {
+      company: 'Another Synthetic', role: 'Other Role', outcome: 'kept', score: 70,
+      scoreBasis: 'private-field', discoveryScore: 10000,
     }],
   })}\n`);
   const latest = await request({ path: '/api/scans/latest' });
   assert.equal(latest.status, 200);
   const text = latest.text;
   assert.match(text, /Synthetic Company/);
+  const reviewed = JSON.parse(text).scan.reviewed;
+  assert.equal(JSON.parse(text).scan.advertsChecked, 60);
+  assert.equal(JSON.parse(text).scan.advertsUnverified, 12);
+  assert.equal(JSON.parse(text).scan.advertsClosed, 2);
+  assert.equal(reviewed[0].scoreBasis, 'assessment-band');
+  assert.equal(reviewed[0].discoveryScore, 24.13);
+  assert.equal(Object.hasOwn(reviewed[1], 'scoreBasis'), false);
+  assert.equal(Object.hasOwn(reviewed[1], 'discoveryScore'), false);
   assert.doesNotMatch(text, /private query|full advert|private evidence|provider prompt/);
+  fs.writeFileSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), `${JSON.stringify({
+    schemaVersion: 3, timestamp: '2026-07-23T10:00:00.000Z', agent: 'codex', mode: 'primary',
+    adverts_checked: -1, adverts_unverified: 10_001, adverts_closed: 1.5,
+  })}\n`);
+  const invalidCounts = JSON.parse((await request({ path: '/api/scans/latest' })).text).scan;
+  for (const key of ['advertsChecked', 'advertsUnverified', 'advertsClosed']) {
+    assert.equal(Object.hasOwn(invalidCounts, key), false);
+  }
   const health = await request({ path: '/api/scan-health' });
   assert.doesNotMatch(health.text, /private query/);
   const storage = JSON.parse(health.text).storagePressure;

@@ -47,7 +47,24 @@ function salaryText(min, max, options) {
   return null;
 }
 
+function salaryCertainty(item) {
+  const predicted = item.salary_is_predicted;
+  const isPredicted = predicted === true || predicted === 1 || predicted === '1';
+  const isNotPredicted = predicted === false || predicted === 0 || predicted === '0';
+  if (isPredicted) return 'estimated';
+  if (!isNotPredicted) return 'unknown';
+
+  const hasMin = item.salary_min !== null && item.salary_min !== undefined && item.salary_min !== '';
+  const hasMax = item.salary_max !== null && item.salary_max !== undefined && item.salary_max !== '';
+  const min = Number(item.salary_min);
+  const max = Number(item.salary_max);
+  if (hasMin && hasMax && Number.isFinite(min) && Number.isFinite(max)) return min === max ? 'exact' : 'range';
+  return 'unknown';
+}
+
 function normalise(item, options) {
+  const certainty = salaryCertainty(item);
+  const salary = salaryText(item.salary_min, item.salary_max, options);
   return {
     providerId: String(item.id || ''),
     sourceRecordId: String(item.id || ''),
@@ -55,7 +72,8 @@ function normalise(item, options) {
     company: item.company?.display_name || '',
     description: item.description || '',
     url: item.redirect_url || '',
-    salary: salaryText(item.salary_min, item.salary_max, options),
+    salary: salary && certainty === 'estimated' ? `${salary} (estimated)` : salary,
+    salaryCertainty: certainty,
     salaryMin: item.salary_min ?? null,
     salaryMax: item.salary_max ?? null,
     salaryCurrency: options.currency || null,

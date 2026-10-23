@@ -143,7 +143,7 @@ function scanCompatibility({
     journalSchemaVersion: 1,
     artifactSchemaVersion: RUN_ARTIFACT_SCHEMA_VERSION,
     stageArtifactSchemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
-    pipelineVersion: 'scan-pipeline-v5-lane-bound',
+    pipelineVersion: 'scan-pipeline-v6-assessment-bands',
     rankingVersion: `ranked-discovery-v1-${scanDigest({
       tracker,
       learningVersionId: learningPolicy?.id || 'learning-baseline',

@@ -17,7 +17,7 @@ import {
 } from './vacancyObservation.mjs';
 import { rankVacancies, vacancyNoveltyComparison } from './vacancyRank.mjs';
 import { selectVacancies } from './vacancySelect.mjs';
-import { partitionVacanciesForAssessment } from './vacancyLifecycle.mjs';
+import { decideVacancyLifecycle } from './vacancyLifecycle.mjs';
 import {
   buildCoverageRollups, buildVacancyExplanations, reconcileCoverageFunnel,
 } from './scanCoverage.mjs';
@@ -44,7 +44,8 @@ import {
 } from './assessmentBatches.mjs';
 import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
 import {
-  applyPreparedMutation, loadPreparedMutation, markerFreeMutationContent, prepareMutation,
+  applyPreparedMutation, loadPreparedMutation, loadRecoverablePreparedFinalisation,
+  markerFreeMutationContent, prepareMutation,
 } from './mutationCoordinator.mjs';
 import {
   jsonReplaceRecipe, renderMutationRecipe, runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe,
@@ -152,10 +153,12 @@ function pipelineRunCandidates(root, requestedRunId) {
       const run = openRunJournal(root, runId);
       if (!run.events.length) continue;
       const manifest = projectRunManifest(run.events);
+      const outcome = manifest.outcome === 'failed'
+        && loadRecoverablePreparedFinalisation(run) ? 'in-progress' : manifest.outcome;
       candidates.push({
         runId,
         updatedAt: run.events.at(-1).recordedAt,
-        outcome: manifest.outcome,
+        outcome,
         compatibility: manifest.compatibility,
         completedWork: manifest.completedWork,
       });
@@ -539,10 +542,12 @@ export async function runScanPipeline({
       leaseOptions,
   );
   let durableQueueSubmission = false;
+  let workspaceLeaseObserved = false;
   let queueCoveragePending = false;
   for (let attempt = 0; !lease && attempt < 64; attempt += 1) {
     const observed = readScanLease(root);
-    if (observed?.operation?.kind === 'provider-health') {
+    if (observed && observed.operation?.kind !== 'scan') {
+      workspaceLeaseObserved = true;
       const waitUntil = Date.parse(observed.expiresAt) + Number(observed.takeoverMarginMs || 0);
       const waitMs = Math.max(1, Math.min(250, waitUntil - Date.now()));
       await waitForTransientLease(waitMs);
@@ -578,13 +583,15 @@ export async function runScanPipeline({
     );
   }
   if (!lease) {
+    const busyWorkspace = workspaceLeaseObserved && !durableQueueSubmission;
     return resultWithOutputs({
       runId: provisionalRunId,
       outcome: durableQueueSubmission ? 'queued' : 'failed',
       manifest: null,
       failures: Object.freeze([{
-        code: durableQueueSubmission ? 'lease-busy' : 'queue-submit-raced',
+        code: durableQueueSubmission ? 'lease-busy' : busyWorkspace ? 'workspace-busy' : 'queue-submit-raced',
         stage: 'initialise',
+        ...(busyWorkspace ? { message: 'another workspace operation is in progress' } : {}),
       }]),
     }, new Map());
   }
@@ -1256,6 +1263,11 @@ export function readVacancyDecisionHistory(root, { limit = VACANCY_DECISION_HIST
         contentFingerprint: /^[a-f0-9]{64}$/.test(String(item.contentFingerprint || ''))
           ? item.contentFingerprint
           : null,
+        ...(item.scoreBasis === 'assessment-band' ? { scoreBasis: 'assessment-band' } : {}),
+        ...(Number.isFinite(Number(item.discoveryScore))
+          && Number(item.discoveryScore) >= 0 && Number(item.discoveryScore) <= 100
+          ? { discoveryScore: Number(item.discoveryScore) }
+          : {}),
         profileId: boundedText(item.profileId || run.profile_id, 80),
         learningVersionId: boundedText(
           item.learningVersionId || run.learning_version_id || 'learning-baseline',
@@ -1278,6 +1290,24 @@ export function readVacancyDecisionHistory(root, { limit = VACANCY_DECISION_HIST
     ...reviewedRecords.slice(0, reviewedCount),
     ...preAssessmentRecords.slice(0, preAssessmentCount),
   ];
+}
+
+function partitionForAssessmentBasis(ranked, history, profileId) {
+  const eligible = [];
+  const skipped = [];
+  for (const vacancy of ranked || []) {
+    const previous = (history || []).find((item) => sameUnderlyingJob(item, vacancy)) || null;
+    const legacyAssessmentScore = previous?.outcome === 'below_threshold'
+      && previous.scoreBasis !== 'assessment-band';
+    const lifecycle = decideVacancyLifecycle(previous, vacancy, {
+      profileId,
+      assessmentChanged: legacyAssessmentScore,
+    });
+    const annotated = { ...vacancy, lifecycle };
+    if (lifecycle.skipAssessment) skipped.push(annotated);
+    else eligible.push(annotated);
+  }
+  return { eligible, skipped };
 }
 
 function observationInputs(sources) {
@@ -1334,7 +1364,7 @@ export function prepareRankedDiscovery({
   const discoveryCounts = laneDiscoveryCounts(vacancies, profile, reviewedHistory);
   const filtered = filterVacancies(vacancies, profile, { learningPolicy });
   const ranked = rankVacancies(filtered.eligible, profile, reviewedHistory, { learningPolicy });
-  const lifecycle = partitionVacanciesForAssessment(ranked, decisionHistory, { profileId: profile.id });
+  const lifecycle = partitionForAssessmentBasis(ranked, decisionHistory, profile.id);
   const configuredThreshold = Number(relevanceThreshold ?? profile?.selection?.relevanceThreshold ?? 1);
   const threshold = Number.isFinite(configuredThreshold) ? Math.max(Number.EPSILON, configuredThreshold) : 1;
   const selection = selectVacancies(lifecycle.eligible, {
@@ -1830,11 +1860,7 @@ export function createRankedDiscoveryStages({
     select: withRankedArtifactCodec('select', function selectStage({ run, priorArtifact }) {
       const configuredThreshold = Number(relevanceThreshold ?? profile?.selection?.relevanceThreshold ?? 1);
       const threshold = Number.isFinite(configuredThreshold) ? Math.max(Number.EPSILON, configuredThreshold) : 1;
-      const lifecycle = partitionVacanciesForAssessment(
-        priorArtifact.ranked,
-        decisionHistory,
-        { profileId: profile.id },
-      );
+      const lifecycle = partitionForAssessmentBasis(priorArtifact.ranked, decisionHistory, profile.id);
       const selection = selectVacancies(lifecycle.eligible, {
         limit,
         threshold,
@@ -2166,25 +2192,36 @@ export function validateAssessments(value, candidates) {
 export function gateAssessment(assessment, policy, candidate = {}) {
   const actionScore = Number(policy?.actionScore ?? 70);
   const checkScore = Number(policy?.checkScore ?? 55);
-  const rankedScore = Number(candidate?.preRankScore);
-  const total = Number.isFinite(rankedScore)
-    ? Math.round(rankedScore * 100) / 100
-    : assessment.recommendation === 'keep' ? actionScore
-      : assessment.recommendation === 'check' ? checkScore : 0;
+  const assessmentBand = assessment.recommendation === 'keep' ? actionScore
+    : assessment.recommendation === 'check' ? checkScore : 0;
+  const total = assessmentBand;
   const unmet = (assessment.mandatoryRequirements || []).filter((item) => item.status === 'unmet');
   const unknown = (assessment.mandatoryRequirements || []).filter((item) => item.status === 'unknown');
   if (assessment.recommendation === 'discard' || unmet.length) {
     return {
       eligibility: 'ineligible',
       score: Math.min(total, checkScore - 1),
+      assessmentBand,
       keep: false,
       reasons: unmet.map((item) => item.requirement),
     };
   }
   if (unknown.length || assessment.recommendation === 'check') {
-    return { eligibility: 'check', score: Math.min(total, actionScore - 1), keep: total >= checkScore, reasons: unknown.map((item) => item.requirement) };
+    return {
+      eligibility: 'check',
+      score: Math.min(total, actionScore - 1),
+      assessmentBand,
+      keep: total >= checkScore,
+      reasons: unknown.map((item) => item.requirement),
+    };
   }
-  return { eligibility: total >= actionScore ? 'eligible' : total >= checkScore ? 'check' : 'below-threshold', score: total, keep: total >= checkScore, reasons: [] };
+  return {
+    eligibility: total >= actionScore ? 'eligible' : total >= checkScore ? 'check' : 'below-threshold',
+    score: total,
+    assessmentBand,
+    keep: total >= checkScore,
+    reasons: [],
+  };
 }
 
 function sourceHealth(sources) {
@@ -2234,7 +2271,11 @@ function mergeTracker(
       profileId: boundedText(profileId, 80),
       learningVersionId: boundedText(learningVersionId, 80),
       categoryId: null,
-      outcome, score: gate.score,
+      outcome, score: gate.score, scoreBasis: 'assessment-band',
+      ...(Number.isFinite(Number(candidate.preRankScore))
+        && Number(candidate.preRankScore) >= 0 && Number(candidate.preRankScore) <= 100
+        ? { discoveryScore: Number(candidate.preRankScore) }
+        : {}),
       reasons: reasons.map((reason) => boundedText(reason)).filter(Boolean).slice(0, REVIEW_REASON_LIMIT),
     };
     if (!gate.keep) {
@@ -2252,7 +2293,16 @@ function mergeTracker(
     const deterministicDimensions = Array.isArray(candidate.dimensions) ? candidate.dimensions : [];
     const generated = {
       id, company: candidate.company, role: candidate.role, location: candidate.location || previous?.location || '', score: gate.score,
-      scoreBreakdown: Object.fromEntries(deterministicDimensions
+      scoreBasis: 'assessment-band',
+      scoreBreakdown: {
+        'assessment-band': gate.assessmentBand,
+        'mandatory-adjustment': gate.score - gate.assessmentBand,
+      },
+      ...(Number.isFinite(Number(candidate.preRankScore))
+        && Number(candidate.preRankScore) >= 0 && Number(candidate.preRankScore) <= 100
+        ? { discoveryScore: Number(candidate.preRankScore) }
+        : {}),
+      discoveryBreakdown: Object.fromEntries(deterministicDimensions
         .filter((item) => item?.name && Number.isFinite(Number(item.score)))
         .map((item) => [item.name, Number(item.score)])),
       eligibility: { status: gate.eligibility, reasons: gate.reasons },

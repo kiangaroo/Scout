@@ -96,7 +96,7 @@ import {
 } from './lib/feedbackLearning.mjs';
 import {
   loadWorkspaceConfig, migrateWorkspace, resolveWorkspaceRoot, seedWorkspace, syncManagedInstructions,
-  mutateWorkspaceConfig, mutateWorkspaceConfigAsync, workspacePaths,
+  mutateWorkspaceConfig, mutateWorkspaceConfigAsync, modelForProvider, workspacePaths,
 } from './lib/workspace.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -448,6 +448,11 @@ function publicLatestScan() {
     categoryId: item?.categoryId ? String(item.categoryId).slice(0, 80) : null,
     outcome: ['kept', 'hard_exclusion', 'mandatory_unmet', 'below_threshold', 'provider_discarded'].includes(item?.outcome) ? item.outcome : 'provider_discarded',
     score: Number.isFinite(Number(item?.score)) ? Number(item.score) : null,
+    ...(item?.scoreBasis === 'assessment-band' ? { scoreBasis: 'assessment-band' } : {}),
+    ...(typeof item?.discoveryScore === 'number'
+      && Number.isFinite(item.discoveryScore) && item.discoveryScore >= 0 && item.discoveryScore <= 100
+      ? { discoveryScore: item.discoveryScore }
+      : {}),
     reasons: (Array.isArray(item?.reasons) ? item.reasons : []).map((reason) => String(reason).slice(0, 220)).slice(0, 3),
   })).slice(0, 80) : [];
   const boundedContribution = (item) => typeof item === 'string' ? item.slice(0, 100) : ({ code: String(item?.code || '').slice(0, 100), score: Number.isFinite(Number(item?.score)) ? Number(item.score) : null });
@@ -475,6 +480,12 @@ function publicLatestScan() {
     }
     return projected;
   };
+  const publicAdvertCount = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 10_000
+    ? value
+    : null;
+  const advertsChecked = publicAdvertCount(run.adverts_checked);
+  const advertsUnverified = publicAdvertCount(run.adverts_unverified);
+  const advertsClosed = publicAdvertCount(run.adverts_closed);
   const boundedSelectionSummary = (value) => value && typeof value === 'object' ? Object.fromEntries(['selected', 'assessed', 'assessmentFailed'].filter((name) => Number.isFinite(Number(value[name]))).map((name) => [name, Number(value[name])])) : null;
   const boundedCoverageRow = (row) => ({
     value: String(row?.value || 'unknown').slice(0, 160),
@@ -528,6 +539,9 @@ function publicLatestScan() {
     profileId: run.profile_id ? String(run.profile_id).slice(0, 80) : null,
     discoveryEngine: run.discovery_engine ? String(run.discovery_engine).slice(0, 80) : null,
     funnel: boundedFunnel(run.funnel), selectionSummary: boundedSelectionSummary(run.selection_summary),
+    ...(advertsChecked === null ? {} : { advertsChecked }),
+    ...(advertsUnverified === null ? {} : { advertsUnverified }),
+    ...(advertsClosed === null ? {} : { advertsClosed }),
     coverage, explanations,
     automaticBroadened: run.mode === 'broadened', reviewed,
   };
@@ -551,6 +565,19 @@ function readScheduleSummary(config = loadWorkspaceConfig(WORKSPACE_ROOT), healt
 
 // Task 5 assigns handlers into this table: routes['POST /api/status'] = (req,res,body)=>{...}
 export const routes = {};
+
+export function resolveManualScanModel(config, provider, requestBody = {}) {
+  if (Object.prototype.hasOwnProperty.call(requestBody, 'model')) {
+    return assertSafeModel(requestBody.model);
+  }
+  return assertSafeModel(modelForProvider(config, provider));
+}
+
+export function queuedManualScanResult(result) {
+  return result?.status === 'queued'
+    ? { ok: true, status: 'queued', runId: result.runId || null }
+    : null;
+}
 
 function loopbackHost(hostHeader) {
   try {
@@ -2653,7 +2680,7 @@ routes['POST /api/scan'] = (req, res, body) => {
   const config = loadWorkspaceConfig(WORKSPACE_ROOT);
   const provider = b.provider || config.ai?.provider;
   let model;
-  try { model = assertSafeModel(b.model); } catch { return replyJson(res, 400, { error: 'model is invalid' }); }
+  try { model = resolveManualScanModel(config, provider, b); } catch { return replyJson(res, 400, { error: 'model is invalid' }); }
   if (!['codex', 'claude'].includes(provider)) return replyJson(res, 400, { error: 'choose an authenticated AI provider first' });
   try {
     const estimate = scanEstimate(readScanRecords(), provider, 'primary');
@@ -2671,6 +2698,8 @@ routes['POST /api/scan'] = (req, res, body) => {
           runId: result.runId || null,
         };
       }
+      const queuedResult = queuedManualScanResult(result);
+      if (queuedResult) return queuedResult;
       if (!result.ok) throw new Error(result.error || `scan ended with ${result.status}`);
       const scanHealth = readScanHealth();
       return {
