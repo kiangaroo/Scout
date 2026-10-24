@@ -7,6 +7,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from './lib/mainModule.mjs';
 import { atomicWriteFile } from './lib/atomicWrite.mjs';
+import { addSpeculativeProspect } from './lib/speculativeProspects.mjs';
+import { loadCachedAdvertObservations, restoreAdvertFacts } from './lib/restoreAdvertFacts.mjs';
 import {
   PROFILE_PUBLICATION_RUN_PREFIX, publishProfileGeneration,
   recoverPendingProfilePublications,
@@ -2226,7 +2228,7 @@ routes['POST /api/sync/passphrase'] = async (req, res, body) => {
   } catch { return replyJson(res, 400, publicApiError('Recovery passphrase could not be changed.')); }
 };
 
-async function applyTrackerMutation(res, mutate, commitMessage, expectedRevision) {
+async function applyTrackerMutation(res, mutate, commitMessage, expectedRevision, responseDetails = () => ({})) {
   const lock = await acquireTrackerMutationLock(WORKSPACE_ROOT);
   if (!lock) return replyJson(res, 409, { conflict: true, error: 'A scan is updating the tracker. Scout did not overwrite it; try again shortly.' });
   try {
@@ -2235,6 +2237,7 @@ async function applyTrackerMutation(res, mutate, commitMessage, expectedRevision
     void scheduleCheckpoint(reason);
     return replyJson(res, 200, {
       ok: true, savedLocally: true, syncQueued: true, trackerRevision: result.revision,
+      ...responseDetails(),
     });
   } catch (e) {
     if (e instanceof TrackerRevisionConflictError) {
@@ -2252,6 +2255,29 @@ async function applyTrackerMutation(res, mutate, commitMessage, expectedRevision
 }
 
 function company(data, id) { try { return findEntry(data, id).company; } catch { return id; } }
+
+routes['POST /api/speculative'] = async (req, res, body) => {
+  const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
+  // Validate user input before taking the shared tracker authority. No source
+  // request, contact lookup or outreach occurs when a prospect is saved.
+  try { addSpeculativeProspect({ opportunities: [] }, b, today()); }
+  catch { return replyJson(res, 400, { error: 'Enter a bounded employer name, public HTTPS careers URL and reason for investigating. Do not include URL credentials or tracking parameters.' }); }
+  await applyTrackerMutation(res, (data) => addSpeculativeProspect(data, b, today()),
+    'ui: add employer prospect', b.trackerRevision);
+};
+
+routes['POST /api/advert-facts/restore'] = async (req, res, body) => {
+  const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
+  try {
+    const { observations, skippedRuns, scannedRuns } = loadCachedAdvertObservations(WORKSPACE_ROOT);
+    let restored = { updated: 0, matched: 0 };
+    await applyTrackerMutation(res, (data) => {
+      restored = restoreAdvertFacts(data, observations);
+      return restored.tracker;
+    }, 'ui: restore saved advert facts', b.trackerRevision,
+    () => ({ restoredJobs: restored.updated, matchedJobs: restored.matched, skippedRuns, scannedRuns }));
+  } catch { return replyJson(res, 400, { error: 'Saved advert evidence could not be restored. Existing jobs have been preserved.' }); }
+};
 
 routes['POST /api/status'] = async (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });

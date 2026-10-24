@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { normaliseIdentityText } from './jobIdentity.mjs';
 import { serializeTracker } from './tracker.mjs';
 import { queryAddressedUrlIdentityDigest } from './vacancyObservation.mjs';
+import { mergeAdvertFacts, sanitizeAdvertFacts } from './advertFacts.mjs';
 
 const RECIPE_VERSION = 1;
 const SAFE_CODE = /^[a-z0-9]+(?:[-_:][a-z0-9]+)*$/;
@@ -233,6 +234,10 @@ function safeOpportunity(entry, existed, prior = null) {
     status: code(requirement?.status, 'unknown'),
   })).filter((requirement) => requirement.id).slice(0, 24);
   const eligibility = code(entry?.eligibility?.status, 'below-threshold');
+  const projectedAdvertFacts = mergeAdvertFacts(
+    sanitizeAdvertFacts(prior?.advertFacts),
+    sanitizeAdvertFacts(entry?.advertFacts),
+  );
   return {
     id,
     company: boundedLabel(entry?.company, 120),
@@ -250,6 +255,7 @@ function safeOpportunity(entry, existed, prior = null) {
         .map((item) => `mandatory-${item.status}`)
         .slice(0, 8),
     },
+    ...(projectedAdvertFacts ? { advertFacts: projectedAdvertFacts } : {}),
     requirementChecks,
     status: SAFE_STATUS.has(entry?.status) ? entry.status : 'new',
     category: code(entry?.category),
@@ -496,6 +502,8 @@ function canonicalTrackerRecipe(recipe) {
         status: code(item?.eligibility?.status, 'below-threshold'),
         reasonCodes: (item?.eligibility?.reasonCodes || []).map((value) => code(value)).filter(Boolean).slice(0, 8),
       },
+      ...(sanitizeAdvertFacts(item?.advertFacts)
+        ? { advertFacts: sanitizeAdvertFacts(item.advertFacts) } : {}),
       requirementChecks: (item?.requirementChecks || []).map((check) => ({
         id: identifier(check?.id),
         status: code(check?.status, 'unknown'),
@@ -557,6 +565,7 @@ function renderTracker(currentContent, recipe) {
       ...(upsert.discoveryScore !== undefined ? { discoveryScore: upsert.discoveryScore } : {}),
       ...(upsert.discoveryBreakdown !== undefined ? { discoveryBreakdown: upsert.discoveryBreakdown } : {}),
       eligibility: { status: upsert.eligibility.status, reasons: upsert.eligibility.reasonCodes },
+      ...(upsert.advertFacts ? { advertFacts: upsert.advertFacts } : {}),
       mandatoryRequirements: requirementChecks,
       status: upsert.status,
       category: upsert.category,

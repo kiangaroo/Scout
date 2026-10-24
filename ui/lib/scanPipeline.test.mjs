@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
-  assessScanCandidates, assessmentCandidatesForSelection, buildAssessmentPrompt, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, durableScanProjection, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
+  archiveStaleInboxEntries, assessScanCandidates, assessmentCandidatesForSelection, buildAssessmentPrompt, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, durableScanProjection, gateAssessment, inboxRecheckCandidates, mergeTracker, prepareRankedDiscovery, promptCandidate,
   filterVacancies, PipelineInterruptedError, readVacancyDecisionHistory, runScanPipeline, validateAssessments, validateWrittenScanArtifacts,
   verificationCandidates, writeScanArtifacts,
 } from './scanPipeline.mjs';
@@ -18,7 +18,7 @@ import {
   applyPreparedMutation, loadPreparedMutation, prepareMutation, withMutationCoordinator,
 } from './mutationCoordinator.mjs';
 import {
-  runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe,
+  renderMutationRecipe, runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe,
 } from './scanMutationProjection.mjs';
 import { profileRuleId } from './searchProfile.mjs';
 import { createEmployerRegistry, employerRegistryRevision } from './employerRegistry.mjs';
@@ -3326,7 +3326,7 @@ test('legacy stage artifacts preserve source order with exact semantic evidence 
 
 test('semantic artifacts provide bounded readable assessment facts without complete advert sentences', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-readable-semantic-evidence-'));
-  const description = 'Build distributed platforms for public services.';
+  const description = 'Build distributed platforms for public services. Three days per week in the office. This is a full-time role.';
   const requirement = 'Kubernetes is mandatory for production clusters.';
   const profile = {
     version: 1, status: 'published', id: 'profile-readable-evidence',
@@ -3356,6 +3356,14 @@ test('semantic artifacts provide bounded readable assessment facts without compl
                 url: 'https://example.test/jobs/readable',
                 description,
                 requirements: requirement,
+                workingPattern: 'hybrid',
+                employmentType: 'permanent',
+                salaryMin: 65000,
+                salaryMax: 75000,
+                salaryCurrency: 'GBP',
+                salaryPeriod: 'year',
+                salaryRateType: 'salary',
+                salaryCertainty: 'range',
               }],
             },
           },
@@ -3370,6 +3378,18 @@ test('semantic artifacts provide bounded readable assessment facts without compl
       candidate.mandatorySignals[0].text,
       'Advert mandatory requirement: kubernetes production clusters.',
     );
+    assert.deepEqual(candidate.advertFacts, {
+      compensation: {
+        minimum: 65000, maximum: 75000, currency: 'GBP', period: 'year',
+        rateType: 'salary', certainty: 'range',
+      },
+      workingPattern: 'hybrid', employmentType: 'permanent', hours: 'full-time',
+      officeDays: 3, sourceUrl: 'https://example.test/jobs/readable',
+      checkedAt: '2026-07-28', availability: 'unverified',
+    });
+    const selectedVacancy = result.stageOutputs.select.selection.selected[0];
+    assert.equal(selectedVacancy.description, '');
+    assert.deepEqual(selectedVacancy.advertFacts, candidate.advertFacts);
     const artifactDirectory = path.join(root, '.scout', 'runs', result.runId, 'artifacts');
     const persisted = fs.readdirSync(artifactDirectory)
       .map((name) => fs.readFileSync(path.join(artifactDirectory, name), 'utf8'))
@@ -3380,6 +3400,98 @@ test('semantic artifacts provide bounded readable assessment facts without compl
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('selected advert facts survive assessment-to-tracker mutation without storing advert text', () => {
+  const url = 'https://example.test/jobs/producer-1?utm_source=campaign';
+  const fullAdvert = 'Three days per week in the office. This is a full-time permanent hybrid role.';
+  const selected = [{
+    vacancyId: 'vacancy-producer-1',
+    employer: { value: 'Example Co', provenance: 'explicit-source' },
+    title: { value: 'Producer', provenance: 'explicit-source' },
+    location: { value: 'London', provenance: 'explicit-source' },
+    canonicalUrl: url,
+    workingPattern: { value: 'hybrid', provenance: 'explicit-source' },
+    employmentType: { value: 'permanent', provenance: 'explicit-source' },
+    compensation: { value: {
+      minimum: 60000, maximum: 70000, currency: 'GBP', period: 'year',
+      rateType: 'salary', certainty: 'range',
+    }, provenance: 'explicit-source' },
+    observations: [{
+      source: 'ats', sourceRecordId: 'producer-1', sourceUrl: url,
+      fetchedAt: '2026-10-24T09:00:00.000Z', description: fullAdvert,
+    }],
+    sourceReferences: [{ source: 'ats', providerId: 'producer-1', url }],
+    semanticEvidence: { descriptionPresent: true, responsibilityFacts: [], mandatorySignals: [] },
+  }];
+  const candidates = assessmentCandidatesForSelection(selected);
+  const candidate = candidates[0];
+  assert.deepEqual(candidate.advertFacts, {
+    compensation: {
+      minimum: 60000, maximum: 70000, currency: 'GBP', period: 'year',
+      rateType: 'salary', certainty: 'range',
+    },
+    workingPattern: 'hybrid', employmentType: 'permanent', hours: 'full-time',
+    officeDays: 3, sourceUrl: 'https://example.test/jobs/producer-1',
+    checkedAt: '2026-10-24', availability: 'unverified',
+  });
+  assert.equal(Object.hasOwn(promptCandidate(candidate), 'advertFacts'), false);
+
+  const merged = mergeTracker(
+    { updated: '2026-10-23', opportunities: [] },
+    candidates,
+    [{ ...assessment('met'), candidateId: candidate.candidateId }],
+    { actionScore: 70, checkScore: 55 },
+    '2026-10-24',
+    'profile-advert-facts',
+  );
+  const current = JSON.stringify({ updated: '2026-10-23', opportunities: [] });
+  const recipe = trackerMergeRecipe(current, JSON.stringify(merged.tracker));
+  const tracker = JSON.parse(renderMutationRecipe('tracker', current, recipe));
+  assert.deepEqual(tracker.opportunities[0].advertFacts, candidate.advertFacts);
+  assert.doesNotMatch(JSON.stringify({ candidate, merged, recipe, tracker }), /Three days per week|full-time permanent hybrid role/i);
+});
+
+test('assessment candidate keeps existing advert facts when selected observations have no description', () => {
+  const existingFacts = {
+    compensation: {
+      minimum: 50000, maximum: null, currency: 'GBP', period: 'year',
+      rateType: 'salary', certainty: 'exact',
+    },
+    workingPattern: 'hybrid', employmentType: 'permanent', hours: 'part-time',
+    officeDays: 2, sourceUrl: 'https://example.test/jobs/known',
+    checkedAt: '2026-10-23', availability: 'unverified',
+  };
+  const candidate = assessmentCandidatesForSelection([{
+    vacancyId: 'vacancy-existing-facts', company: 'Example Co', title: 'Editor',
+    url: 'https://example.test/jobs/known', canonicalUrl: 'https://example.test/jobs/known',
+    advertFacts: existingFacts,
+    observations: [{ sourceUrl: 'https://example.test/jobs/known', fetchedAt: null }],
+  }])[0];
+  assert.deepEqual(candidate.advertFacts, existingFacts);
+});
+
+test('inbox liveness checks and stale archiving skip employer prospects and legacy speculative tags', () => {
+  const tracker = { opportunities: [
+    { id: 'active-role', status: 'new', sources: ['https://example.test/jobs/role'] },
+    { id: 'typed-prospect', status: 'new', type: 'employer-prospect', sources: ['https://example.test/careers'] },
+    { id: 'kind-prospect', status: 'new', opportunityKind: 'employer-prospect', sources: ['https://example.test/jobs'] },
+    { id: 'legacy-prospect', status: 'new', tags: [' SPECULATIVE OUTREACH '], sources: ['https://example.test/careers'] },
+  ] };
+  const candidates = inboxRecheckCandidates(tracker);
+  assert.deepEqual(candidates.checkable.map((item) => item._trackerId), ['active-role']);
+  assert.deepEqual(candidates.missingSource, []);
+
+  archiveStaleInboxEntries(tracker, [
+    ...tracker.opportunities.map((entry) => ({
+      _trackerId: entry.id,
+      liveness: { state: 'gone', reason: 'synthetic unavailable response' },
+    })),
+  ], '2026-10-24');
+  assert.equal(tracker.opportunities[0].status, 'ignore');
+  assert.equal(tracker.opportunities[1].status, 'new');
+  assert.equal(tracker.opportunities[2].status, 'new');
+  assert.equal(tracker.opportunities[3].status, 'new');
 });
 
 test('fresh scan refuses storage pressure before its first lease, queue or journal append', async () => {

@@ -649,6 +649,46 @@ test('renderSpeculative shows an empty state when nothing matches', () => {
   assert.match(doc.getElementById('tab-speculative').innerHTML, /No speculative opportunities match/);
 });
 
+test('speculative view explains employer prospects and provides a creation path', () => {
+  const { scout, context } = loadScout();
+  const { doc } = withJobsDom();
+  context.document = doc;
+  scout.filterBar = () => '';
+  scout.state.data = { opportunities: [] };
+  scout.renderSpeculative();
+  const html = doc.getElementById('tab-speculative').innerHTML;
+  assert.match(html, /not confirmed vacancies/i);
+  assert.match(html, /data-action="toggle-prospect-form"/);
+  assert.match(html, /data-action="save-prospect"/);
+  assert.match(html, /id="prospect-careers-url"/);
+});
+
+test('job detail facts show estimates, unknown gates and escaped source information', () => {
+  const { scout } = loadScout();
+  const html = scout.advertFactsHtml({ advertFacts: {
+    compensation: { minimum: 30000, maximum: 40000, currency: 'GBP', period: 'year', certainty: 'estimated' },
+    workingPattern: 'hybrid', employmentType: 'permanent', hours: 'full-time', officeDays: null,
+    checkedAt: '2026-07-24', availability: 'unverified', sourceUrl: 'https://jobs.example/role',
+  } });
+  assert.match(html, /30,000/);
+  assert.match(html, /estimated/i);
+  assert.match(html, /Office days/);
+  assert.match(html, /Not stated/);
+  assert.match(html, /availability not verified/i);
+  assert.match(html, /Take-home pay/);
+  assert.match(html, /data-action="restore-advert-facts"/);
+  assert.match(html, /href="https:\/\/jobs.example\/role"/);
+  assert.doesNotMatch(scout.advertFactsHtml({ advertFacts: { sourceUrl: 'javascript:alert(1)' } }), /href="javascript/);
+  assert.doesNotMatch(scout.advertFactsHtml({}), /GBP 0/);
+});
+
+test('employer prospects do not claim advertised job conditions', () => {
+  const { scout } = loadScout();
+  const html = scout.advertFactsHtml({ opportunityKind: 'employer-prospect' });
+  assert.match(html, /no vacancy, salary or working arrangement is confirmed/i);
+  assert.doesNotMatch(html, /data-action="restore-advert-facts"/);
+});
+
 test('triage actions post the right status transitions', async () => {
   const { scout } = loadScout();
   scout.state.data = {

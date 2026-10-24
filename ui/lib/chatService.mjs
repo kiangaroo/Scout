@@ -12,6 +12,7 @@ import { runCvQuality } from './cvQuality.mjs';
 import { artifactSlugFor, chooseArtifactSlug } from './cvArtifacts.mjs';
 import { listCvFiles } from './cv.mjs';
 import { readUsage } from './usage.mjs';
+import { sanitizeAdvertFacts } from './advertFacts.mjs';
 import {
   detectedModels, effectiveProviderModel, isSafeModelId, providerModelCatalogue,
 } from './providerModels.mjs';
@@ -275,6 +276,9 @@ export function registerChatRoutes({
       scoreBreakdown: entry.scoreBreakdown || {}, eligibility: entry.eligibility || null,
       mandatoryRequirements: entry.mandatoryRequirements || [], location: entry.location || entry.commute || null,
       salary: entry.salary || null, sources: (entry.sources || []).slice(0, 5), notes: String(entry.notes || '').slice(0, 4000),
+      opportunityKind: entry.opportunityKind === 'employer-prospect' || entry.type === 'employer-prospect'
+        || entry.tags?.some((tag) => String(tag).trim().toLowerCase() === 'speculative outreach') ? 'employer-prospect' : 'vacancy-record',
+      advertFacts: sanitizeAdvertFacts(entry.advertFacts),
       application: entry.application || null, contacts: (entry.contacts || []).slice(0, 20),
     };
     return `Selected opportunity (authoritative; do not choose another tracker entry):\n${JSON.stringify(selected)}`;

@@ -230,6 +230,10 @@ Pushing or merging a branch does not by itself update the live VPS.
 
 ## Maintenance contract
 
+Scans retain bounded structured advert facts through canonical tracker mutation recipes, without full advert bodies or raw provider responses. Older jobs can recover known facts from at most the latest 20 retained scan journals through the revision-checked tracker mutation route. Cached restoration fills missing facts, preserves decisions and known facts, and never counts as a fresh availability check. Unreadable evidence is skipped; an oversized evidence set fails explicitly.
+
+Speculative entries are explicit employer prospects created under the same revision and mutation fence as tracker edits. They have no invented vacancy or score. Saving one neither sends outreach nor enables monitoring; monitoring remains separate owner-reviewed registry configuration.
+
 Critical mutable workspace records are replaced atomically. Scout writes new contents to a temporary file in the same directory, flushes that file, and then renames it over the canonical path. This covers configuration, tracker state, chats, company timelines, CV-quality records, onboarding state, scan artifacts, recovery metadata, and imported CV text. Code that adds another critical workspace write must use the shared atomic-write helper; temporary files are never a source of truth.
 
 Multi-file onboarding activation additionally writes a prepared intent before

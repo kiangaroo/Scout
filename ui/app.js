@@ -942,8 +942,47 @@ const Scout = {
       .map(([label, items]) => `<div class="label">${label} (${items.length})</div>${items.map((e) => this.cardHtml(e)).join('')}`)
       .join('');
     target.innerHTML = this.filterBar()
+      + '<p class="meta">Employer prospects are not confirmed vacancies. Use this list to research organisations and plan an enquiry. Normal vacancy scans do not automatically generate speculative prospects. Nothing is sent on your behalf.</p>'
+      + '<button class="act" data-action="toggle-prospect-form">Add employer prospect</button>'
+      + `<div id="prospect-form" ${this.prospectFormOpen ? '' : 'hidden'}>
+        <label class="setup-field">Employer<input id="prospect-company" maxlength="120" autocomplete="organization"></label>
+        <label class="setup-field">Official careers or organisation HTTPS URL<input id="prospect-careers-url" type="url" placeholder="https://example.org/careers"></label>
+        <label class="setup-field">Work to explore (optional)<input id="prospect-role-focus" maxlength="120"></label>
+        <label class="setup-field">Location (optional; does not confirm a commute)<input id="prospect-location" maxlength="160"></label>
+        <label class="setup-field">Why investigate this employer, and what needs checking?<textarea id="prospect-interest" maxlength="1000"></textarea></label>
+        <p class="meta">Add a researched lead, not an invented job. Salary, attendance, vacancy availability and fit remain unconfirmed.</p>
+        <button class="act primary" data-action="save-prospect">Save employer prospect</button>
+        <div id="prospect-message" role="status"></div>
+      </div>`
       + `<div class="label">Speculative opportunities (${entries.length})</div>`
       + (list || '<p class="inbox-empty">No speculative opportunities match the current commute filter.</p>');
+  },
+
+  toggleProspectForm() {
+    this.prospectFormOpen = !this.prospectFormOpen;
+    const form = document.getElementById('prospect-form');
+    if (form) form.hidden = !this.prospectFormOpen;
+    if (this.prospectFormOpen) document.getElementById('prospect-company')?.focus();
+  },
+
+  async saveProspect() {
+    const value = (id) => String(document.getElementById(id)?.value || '').trim();
+    const payload = { company: value('prospect-company'), careersUrl: value('prospect-careers-url'), roleFocus: value('prospect-role-focus'), location: value('prospect-location'), interest: value('prospect-interest') };
+    const message = document.getElementById('prospect-message');
+    if (!payload.company || !payload.careersUrl || !payload.interest) {
+      if (message) message.textContent = 'Enter the employer, official HTTPS URL and your reason for investigating.';
+      return;
+    }
+    const result = await this.post('/api/speculative', payload);
+    if (result?.ok) {
+      this.prospectFormOpen = false;
+      this.renderSpeculative();
+    }
+  },
+
+  async restoreAdvertFacts() {
+    const result = await this.post('/api/advert-facts/restore', {});
+    if (result?.ok) alert(`${Number(result.restoredJobs || 0)} jobs gained saved facts.${result.skippedRuns ? ` ${Number(result.skippedRuns)} unreadable scan records were skipped.` : ''} This does not recheck whether an advert is still open. Remaining unknowns need the original advert or employer confirmation.`);
   },
 
   updateJobsBadge(count) {
@@ -1293,6 +1332,31 @@ const Scout = {
       + thin + text;
   },
 
+  advertFactsHtml(e) {
+    if (e.opportunityKind === 'employer-prospect') return '<div class="label">Employer prospect</div><p class="meta">A research lead: no vacancy, salary or working arrangement is confirmed. Review the official source and check the employer’s enquiry policy before contacting them.</p>';
+    const f = e.advertFacts || {};
+    const unknown = 'Not stated in the available source';
+    const c = f.compensation;
+    const amount = (n) => typeof n === 'number' && Number.isFinite(n) ? n.toLocaleString('en-GB') : null;
+    const low = amount(c?.minimum), high = amount(c?.maximum);
+    const range = low && high && low !== high ? `${low}–${high}` : low || high;
+    const salary = range ? `${c.currency || 'Currency unknown'} ${range}${c.period && c.period !== 'unknown' ? ` / ${c.period}` : ' (period unknown)'}${c.certainty === 'estimated' ? ' — estimated by source' : c.certainty === 'unknown' ? ' — certainty unknown' : ''}` : unknown;
+    const row = (label, text) => `<div class="meta"><b>${this.esc(label)}</b> ${this.esc(text)}</div>`;
+    const factsSource = this.safeHref(f.sourceUrl);
+    return '<div class="label">Advert facts and checks</div>'
+      + row('Salary', salary)
+      + row('Working pattern', f.workingPattern || unknown)
+      + row('Office days', Number.isInteger(f.officeDays) ? `${f.officeDays} per week stated` : unknown)
+      + row('Contract', f.employmentType || unknown)
+      + row('Hours', f.hours || unknown)
+      + row('Take-home pay', 'Needs an individual check; a gross salary does not confirm net pay')
+      + row('Evidence date', f.checkedAt || 'No saved source facts yet')
+      + row('Advert availability', f.availability === 'live' ? 'Verified open at the recorded check' : f.availability === 'gone' ? 'Reported closed — review source' : 'Current availability not verified')
+      + (factsSource ? `<div class="meta"><a href="${factsSource}" target="_blank" rel="noopener">Saved facts source</a></div>` : '')
+      + '<p class="meta">Missing facts are unknown, not passes. Hybrid alone does not confirm office days. Check the office address and door-to-door route separately.</p>'
+      + '<button class="act" data-action="restore-advert-facts">Restore facts from saved scans</button>';
+  },
+
   detailHtml(e) {
     const bd = e.scoreBreakdown || {};
     const bars = ['technical', 'sector', 'upside', 'comp', 'location', 'acceleration', 'credibility']
@@ -1340,6 +1404,7 @@ const Scout = {
          </div>`
       : '';
     return `
+      ${this.advertFactsHtml(e)}
       ${sourcePanel}
       <div class="label">score breakdown (read-only)</div>${assessmentScore ? `<div class="meta">${this.esc(assessmentScore)}. Assessment band markers are not percentage fit scores.</div>` : ''}${bars || '<div class="meta">not scored yet</div>'}
       <div class="label">tags</div>${tags || '<div class="meta">-</div>'}
@@ -1410,6 +1475,7 @@ const Scout = {
     const trackerMutation = new Set([
       '/api/status', '/api/note', '/api/log', '/api/contact', '/api/category',
       '/api/commute', '/api/applied', '/api/rejected', '/api/stage', '/api/stage/complete',
+      '/api/speculative', '/api/advert-facts/restore',
     ]).has(pathname);
     const requestPayload = trackerMutation
       ? { ...payload, trackerRevision: this.state.data?.trackerRevision }
@@ -2995,6 +3061,9 @@ const Scout = {
       case 'close-scan-result': return this.closeScanResult();
       case 'complete-stage': return this.completeStage(id, Number(index));
       case 'toggle-source': return this.toggleSourcePanel(id, element);
+      case 'toggle-prospect-form': return this.toggleProspectForm();
+      case 'save-prospect': return this.saveProspect();
+      case 'restore-advert-facts': return this.restoreAdvertFacts();
       case 'mark-applied': return this.markApplied(id);
       case 'mark-accepted': return this.markAccepted(id);
       case 'mark-rejected': return this.rejectOpportunity(id);

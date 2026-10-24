@@ -25,6 +25,7 @@ import {
   PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION, commitRunArtifact, projectRunManifest,
   readRunArtifact, validateManifestAgreement,
 } from './runArtifacts.mjs';
+import { advertFacts, mergeAdvertFacts, sanitizeAdvertFacts } from './advertFacts.mjs';
 import { appendRunEvent, openRunJournal, validateRunJournal } from './runJournal.mjs';
 import { recoverRun, selectRecoverableRun } from './runRecovery.mjs';
 import {
@@ -1152,6 +1153,31 @@ function assessmentVacancy(vacancy) {
   void omittedObservations;
   const references = sourceReferences(vacancy);
   const url = vacancy?.canonicalUrl || observation.sourceUrl || references[0]?.url || '';
+  const fetchedAt = observations
+    .map((item) => String(item?.fetchedAt || ''))
+    .filter(Boolean)
+    .sort()
+    .at(-1) || observation.fetchedAt || null;
+  const description = observations
+    .map((item) => String(item?.description || '').slice(0, 12_000))
+    .join('\n')
+    .slice(0, 12_000);
+  const observedFacts = observations
+    .filter((item) => item?.advertFacts)
+    .sort((left, right) => String(left?.fetchedAt || '').localeCompare(String(right?.fetchedAt || '')))
+    .reduce((facts, item) => mergeAdvertFacts(facts, item.advertFacts), null);
+  const fallbackFacts = advertFacts({
+    url,
+    fetchedAt,
+    compensation: vacancy?.compensation,
+    workingPattern: vacancy?.workingPattern,
+    employmentType: vacancy?.employmentType,
+    description,
+  });
+  const retainedAdvertFacts = mergeAdvertFacts(
+    mergeAdvertFacts(sanitizeAdvertFacts(vacancy?.advertFacts), observedFacts),
+    fallbackFacts,
+  );
   return {
     ...canonicalVacancy,
     company: valueOf(vacancy?.employer) || '',
@@ -1160,6 +1186,7 @@ function assessmentVacancy(vacancy) {
     location: valueOf(vacancy?.location) || '',
     workingType: valueOf(vacancy?.workingPattern) || '',
     salary: valueOf(vacancy?.compensation) || null,
+    ...(retainedAdvertFacts ? { advertFacts: retainedAdvertFacts } : {}),
     postedDate: vacancy?.postedAt || null,
     source: observation.source || references[0]?.source || '',
     providerId: observation.sourceRecordId || references[0]?.providerId || '',
@@ -1521,7 +1548,8 @@ function digestText(value) {
   return createHash('sha256').update(String(value || '')).digest('hex');
 }
 
-function semanticObservation(job, sourceName, source, profile, { durableUrls = true } = {}) {
+function semanticObservation(job, sourceName, source, profile, { durableUrls = true, fetchedAt = null } = {}) {
+  const observedAt = source?.fetchedAt || source?.generatedAt || fetchedAt || job?.fetchedAt || null;
   const observation = normaliseObservation(job, {
     sourceName: job?.source || sourceName,
     collectionSource: sourceName,
@@ -1577,6 +1605,14 @@ function semanticObservation(job, sourceName, source, profile, { durableUrls = t
     ...safeObservation
   } = observation;
   void omittedDescription;
+  const vacancyFacts = advertFacts({
+    url: observation.sourceUrl,
+    fetchedAt: observedAt || observation.fetchedAt,
+    compensation: observation.compensation,
+    workingPattern: observation.workingPattern,
+    employmentType: observation.employmentType,
+    description,
+  });
   return {
     ...safeObservation,
     sourceUrl: durableUrls ? privacySafeStageUrl(sourceUrl) : sourceUrl,
@@ -1588,6 +1624,7 @@ function semanticObservation(job, sourceName, source, profile, { durableUrls = t
       seniority: identity.seniority,
       evidenceTokenDigests: identity.evidenceTokens.map(digestText),
     },
+    ...(vacancyFacts ? { advertFacts: vacancyFacts } : {}),
     semanticEvidence: {
       descriptionPresent: Boolean(description.trim()),
       descriptionDigest,
@@ -1637,7 +1674,7 @@ function semanticCollectedSource(source, sourceName, profile, options = {}) {
   };
 }
 
-function legacySemanticJob(job, sourceName, { durableUrls = true } = {}) {
+function legacySemanticJob(job, sourceName, { durableUrls = true, fetchedAt = null } = {}) {
   const candidate = normaliseJob(job);
   if (!candidate) return null;
   const description = String(job?.description || '');
@@ -1646,6 +1683,21 @@ function legacySemanticJob(job, sourceName, { durableUrls = true } = {}) {
     candidate.url,
     candidate.urlIdentityDigest,
   );
+  const retainedAdvertFacts = advertFacts({
+    url: candidate.url,
+    fetchedAt: fetchedAt || job?.fetchedAt || null,
+    compensation: job?.compensation || {
+      minimum: job?.salaryMin,
+      maximum: job?.salaryMax,
+      currency: job?.salaryCurrency,
+      period: job?.salaryPeriod,
+      rateType: job?.salaryRateType || job?.compensationRateType || job?.rateType,
+      certainty: job?.salaryCertainty || job?.compensationCertainty,
+    },
+    workingPattern: job?.workingPattern || job?.workingType,
+    employmentType: job?.employmentType,
+    description,
+  });
   return {
     company: candidate.company,
     title: candidate.role,
@@ -1658,6 +1710,7 @@ function legacySemanticJob(job, sourceName, { durableUrls = true } = {}) {
     providerId: candidate.providerId,
     ...(urlIdentityDigest ? { urlIdentityDigest } : {}),
     ...(urlIdentityDigest ? { urlIdentityProvenance: 'durable-query-v1' } : {}),
+    ...(retainedAdvertFacts ? { advertFacts: retainedAdvertFacts } : {}),
     sourceReferences: candidate.sourceReferences.map((reference) => ({
       ...reference,
       url: durableUrls ? privacySafeStageUrl(reference.url) : reference.url,
@@ -1681,7 +1734,10 @@ function legacySemanticJob(job, sourceName, { durableUrls = true } = {}) {
 
 function legacySemanticCollectedSource(source, sourceName, options = {}) {
   const jobs = Array.isArray(source?.jobs) ? source.jobs : [];
-  const semanticJobs = jobs.map((job) => legacySemanticJob(job, sourceName, options)).filter(Boolean);
+  const semanticJobs = jobs.map((job) => legacySemanticJob(job, sourceName, {
+    ...options,
+    fetchedAt: source?.fetchedAt || source?.generatedAt || null,
+  })).filter(Boolean);
   return {
     configured: Boolean(source?.configured),
     status: ['healthy', 'degraded', 'unavailable'].includes(source?.status) ? source.status : 'unavailable',
@@ -1725,7 +1781,10 @@ function encodePipelineStageValue(stageId, value, profile = null, { durableUrls 
       .map(([source, result]) => [
         String(source).slice(0, 80),
         profile
-          ? semanticCollectedSource(result, source, profile, { durableUrls })
+          ? semanticCollectedSource(result, source, profile, {
+            durableUrls,
+            fetchedAt: value?.generatedAt || null,
+          })
           : legacySemanticCollectedSource(result, source, { durableUrls }),
       ])),
   };
@@ -1948,6 +2007,7 @@ export function inboxRecheckCandidates(tracker, incomingCandidates = []) {
   const missingSource = [];
   for (const entry of tracker?.opportunities || []) {
     if (entry.status !== 'new') continue;
+    if (isEmployerProspect(entry)) continue;
     if (incomingCandidates.some((candidate) => sameUnderlyingJob(entry, candidate))) continue;
     const url = (entry.sources || []).map(safeSourceUrl).find(Boolean);
     const candidate = { _inboxRecheck: true, _trackerId: entry.id, url };
@@ -1957,12 +2017,20 @@ export function inboxRecheckCandidates(tracker, incomingCandidates = []) {
   return { checkable, missingSource };
 }
 
-function archiveStaleInboxEntries(tracker, entries, date) {
+function isEmployerProspect(entry) {
+  return entry?.type === 'employer-prospect'
+    || entry?.opportunityKind === 'employer-prospect'
+    || (Array.isArray(entry?.tags) && entry.tags.some((tag) => (
+      String(tag || '').trim().toLowerCase() === 'speculative outreach'
+    )));
+}
+
+export function archiveStaleInboxEntries(tracker, entries, date) {
   const reasons = new Map(entries.map((item) => [item._trackerId, item.liveness?.reason || 'advert is no longer live']));
   let archived = 0;
   for (const entry of tracker.opportunities || []) {
     const reason = reasons.get(entry.id);
-    if (entry.status !== 'new' || !reason) continue;
+    if (entry.status !== 'new' || !reason || isEmployerProspect(entry)) continue;
     entry.status = 'ignore';
     entry.tags = [...new Set([...(entry.tags || []), 'Advert unavailable'])];
     const note = `[${date}] Removed from Jobs automatically: ${reason}.`;
@@ -2231,7 +2299,7 @@ function sourceHealth(sources) {
   }]));
 }
 
-function mergeTracker(
+export function mergeTracker(
   existing,
   candidates,
   assessments,
@@ -2291,6 +2359,7 @@ function mergeTracker(
     const references = mergeSourceReferences(previous || {}, candidate);
     const urls = references.map((reference) => reference.url).filter(Boolean);
     const deterministicDimensions = Array.isArray(candidate.dimensions) ? candidate.dimensions : [];
+    const mergedAdvertFacts = mergeAdvertFacts(previous?.advertFacts, candidate.advertFacts);
     const generated = {
       id, company: candidate.company, role: candidate.role, location: candidate.location || previous?.location || '', score: gate.score,
       scoreBasis: 'assessment-band',
@@ -2307,6 +2376,7 @@ function mergeTracker(
         .map((item) => [item.name, Number(item.score)])),
       eligibility: { status: gate.eligibility, reasons: gate.reasons },
       mandatoryRequirements: assessment.mandatoryRequirements,
+      ...(mergedAdvertFacts ? { advertFacts: mergedAdvertFacts } : {}),
       status: previous?.status || 'new', category: previous?.category || null,
       tags: [...new Set([...(previous?.tags || []), ...(candidate.tags || []), ...(gate.eligibility === 'check' ? ['Check mandatory requirement'] : []), ...(changedAdvert ? ['Updated advert — review'] : [])])],
       sources: [...new Set([...(previous?.sources || []), ...urls])], sourceReferences: references,

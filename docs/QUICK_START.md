@@ -143,6 +143,23 @@ New opportunities land in the **Jobs** tab, highest score first, each carrying a
 
 The **All** tab is a searchable table. On a phone, swipe the labelled table region horizontally to reach commute, stage, status and last-checked columns; filtering keeps the text cursor and in-progress keyboard composition in place.
 
+### Understand missing advert details
+
+Expand a job to see **Advert facts and checks**. Scout retains bounded structured salary, working pattern, contract, full/part-time and explicit office-day facts when available. Estimated salaries remain labelled estimates. Hybrid does not establish office days; gross salary does not establish take-home pay. Missing facts remain unknown and cannot satisfy mandatory requirements.
+
+For older saved jobs, select **Restore facts from saved scans**. This repairs matching jobs from retained scan artifacts without another source request or AI call. It preserves status, scores, notes, contacts, commute and application history. The evidence date is the original capture date, not a fresh availability check. Old or unreadable evidence may be unavailable. Use **show what the source says** and the original advert for remaining gaps; blocked pages are not bypassed.
+
+### Use Speculative for employer prospects
+
+**Speculative** holds researched employers you might approach even when no suitable vacancy is confirmed. Ordinary vacancy scans do not automatically generate these prospects.
+
+1. Open **Speculative → Add employer prospect**.
+2. Enter the employer, its official public HTTPS careers or organisation URL, work to explore and your evidence-based reason for investigating. Include unresolved questions in the notes.
+3. Save the prospect. It has no fit score, verified vacancy, salary or working arrangement. Research those before making a decision.
+4. Shortlist, add notes and contacts, or prepare a draft using the normal opportunity tools. Check whether the employer accepts speculative enquiries; a jobs page alone does not establish that. Send any chosen outreach yourself.
+
+To monitor advertised vacancies automatically, configure the employer separately in **Settings → Employers**, review access terms and robots permission, and supply a supported public ATS board or careers URL. Login-protected or JavaScript-only pages may need manual checking. Adding a prospect does not enable crawling or register for job alerts.
+
 ## 7. Enable daily scans (optional)
 
 During setup, choose the local daily time and enable the schedule after the first healthy scan. Return to **Settings → First scan** to change or disable it later — an existing schedule's time, days and model stay editable even after a later run is unhealthy, stale or skipped. The command-line equivalent is:

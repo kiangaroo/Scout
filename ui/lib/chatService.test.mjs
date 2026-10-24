@@ -225,6 +225,24 @@ test('interview prep sends a pinned prompt and persists only to the prep transcr
   assert.equal(saved.messages.at(-1).text, 'Prepared.');
 });
 
+test('selected job chat receives saved advert facts and identifies employer prospects', async () => {
+  const root = tmpRoot();
+  let captured;
+  const routes = routeFixture(root, {
+    readTracker: () => ({ opportunities: [{ ...ENTRY, opportunityKind: 'employer-prospect',
+      advertFacts: { workingPattern: 'hybrid', officeDays: 2, sourceUrl: 'https://jobs.example/role', checkedAt: '2026-07-24' },
+    }] }),
+    runTurnFn: (options) => {
+      captured = options;
+      return { stop() {}, finished: Promise.resolve({ ok: true, text: 'Reviewed.', updates: [], sessionId: 'facts-session', filesTouched: [], usage: {} }) };
+    },
+  });
+  await callRoute(routes['POST /api/chat/send'], JSON.stringify({ id: ID, engine: 'codex', text: 'What remains unknown?' }));
+  assert.match(captured.prompt, /"opportunityKind":"employer-prospect"/);
+  assert.match(captured.prompt, /"officeDays":2/);
+  assert.match(captured.prompt, /"workingPattern":"hybrid"/);
+});
+
 test('interview prep handoff resumes the separate prep conversation', async () => {
   const root = tmpRoot();
   const prep = emptyChat('claude');

@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 
+
 const previousWorkspace = process.env.SCOUT_WORKSPACE;
 const previousDeviceSettings = process.env.SCOUT_DEVICE_SETTINGS;
 const testWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-server-test-'));
@@ -2209,6 +2210,43 @@ test('a UI mutation racing scan completion preserves every tracked user field', 
   assert.deepEqual(saved.application, original.opportunities[0].application);
   assert.match(saved.notes, /Existing note/);
   assert.match(saved.notes, /Arrived during scan completion/);
+});
+
+test('speculative API creates a distinct unscored employer prospect and rejects stale writes', { concurrency: false }, async () => {
+  seedWorkspace(APP_ROOT, testWorkspace);
+  const trackerFile = path.join(testWorkspace, 'data', 'opportunities.json');
+  const existing = { id: 'kept-role', company: 'Existing', role: 'Writer', status: 'shortlist', score: 55, notes: 'Keep my note' };
+  fs.writeFileSync(trackerFile, JSON.stringify({ opportunities: [existing] }));
+  const before = JSON.parse((await request({ path: '/api/opportunities' })).text);
+  const headers = { host: `127.0.0.1:${port}`, origin: `http://127.0.0.1:${port}`, 'content-type': 'application/json' };
+  const input = { company: 'Example Arts', careersUrl: 'https://arts.example/careers', interest: 'Research illustration and publications; no vacancy confirmed', roleFocus: 'Creative communications', trackerRevision: before.trackerRevision };
+  const result = await request({ method: 'POST', path: '/api/speculative', headers, body: JSON.stringify(input) });
+  assert.equal(result.status, 200, result.text);
+  const saved = JSON.parse(fs.readFileSync(trackerFile));
+  assert.deepEqual(saved.opportunities[0], existing);
+  assert.equal(saved.opportunities[1].opportunityKind, 'employer-prospect');
+  assert.equal(saved.opportunities[1].score, null);
+  assert.equal(saved.opportunities[1].lastChecked, null);
+  const stale = await request({ method: 'POST', path: '/api/speculative', headers, body: JSON.stringify({ ...input, company: 'Second Arts' }) });
+  assert.equal(stale.status, 409);
+  assert.equal(JSON.parse(fs.readFileSync(trackerFile)).opportunities.length, 2);
+});
+
+test('cached advert repair reports no added facts honestly and preserves tracker decisions', { concurrency: false }, async () => {
+  seedWorkspace(APP_ROOT, testWorkspace);
+  const trackerFile = path.join(testWorkspace, 'data', 'opportunities.json');
+  const existing = { id: 'no-cache-job', company: 'Uncached', role: 'Writer', status: 'shortlist', score: 55, notes: 'Keep my decision' };
+  fs.writeFileSync(trackerFile, JSON.stringify({ opportunities: [existing] }));
+  const before = JSON.parse((await request({ path: '/api/opportunities' })).text);
+  const host = `127.0.0.1:${port}`;
+  const response = await request({ method: 'POST', path: '/api/advert-facts/restore',
+    headers: { host, origin: `http://${host}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ trackerRevision: before.trackerRevision }),
+  });
+  assert.equal(response.status, 200, response.text);
+  assert.equal(JSON.parse(response.text).restoredJobs, 0);
+  assert.equal(JSON.parse(response.text).matchedJobs, 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(trackerFile)).opportunities, [existing]);
 });
 
 test('runtime shutdown closes admission and drains checkpoints produced while work settles', async () => {

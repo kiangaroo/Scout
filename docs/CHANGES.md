@@ -2,6 +2,10 @@
 
 ## Fixed
 
+- Retain structured advert pay, working pattern, contract, hours and explicit weekly office-day facts, with estimates and unknowns labelled in job details.
+- Restore missing facts for existing jobs from retained scan evidence without changing decisions or making another source/model request. Cached evidence is not a fresh availability check.
+- Add researched, unscored employer prospects through Speculative. Saving one does not send an enquiry or silently enable employer crawling. Prospects are excluded from vacancy liveness checks.
+
 - Profile-publication transactions no longer appear as running scans. Paused
   scans and historical queue claims no longer imply that a worker is active.
 
