@@ -30,6 +30,45 @@ function loadScout() {
   return { scout: context.window.Scout, context };
 }
 
+test('source recovery searches only the public employer and role and explains uncertainty', () => {
+  const { scout } = loadScout();
+  const entry = { company: 'Example & Co', role: 'Editor "Food"', notes: 'PRIVATE-NOTES', contacts: [{ email: 'PRIVATE-EMAIL' }], sources: ['javascript:alert(1)', 'https://example.test/jobs/17'] };
+  assert.equal(scout.primarySource(entry), 'https://example.test/jobs/17');
+  const html = scout.sourceRecoveryHtml(entry);
+  assert.match(html, /Search for this job/);
+  assert.match(html, /google\.com\/search/);
+  assert.match(html, /not verified/i);
+  assert.doesNotMatch(html, /PRIVATE|javascript:/);
+  const match = html.match(/href="([^"]*google[^\"]*)"/);
+  const url = new URL(match[1].replaceAll('&amp;', '&'));
+  assert.equal(url.searchParams.get('q'), '"Example & Co" "Editor Food"');
+  assert.equal(scout.sourceRecoveryHtml({ company: '', role: '' }), '');
+});
+
+test('source fetch failure offers the job search rather than only the failing link', () => {
+  const { scout } = loadScout();
+  const entry = { company: 'Example', role: 'Editor', sources: ['https://example.test/job'] };
+  const html = scout.sourceBodyHtml({ ok: false, error: 'source returned 403' }, entry);
+  assert.match(html, /403/);
+  assert.match(html, /Search for this job/);
+  assert.match(html, /does not prove.*closed/i);
+  const fallback = scout.sourceBodyHtml({ ok: true, url: 'https://other.test/job', fetchedAt: '2026-10-24T12:00:00Z', facts: {}, text: 'Job text', thin: false, fallbackUsed: true }, entry);
+  assert.match(fallback, /saved alternative/i);
+});
+
+test('a failed source preview can be retried by reopening it', async () => {
+  const { scout } = loadScout();
+  let calls = 0;
+  const body = { style: { display: 'none' }, dataset: {}, innerHTML: '' };
+  const button = { closest: () => ({ querySelector: () => body }), textContent: '' };
+  scout.state.data = { opportunities: [{ id: 'example', company: 'Example', role: 'Editor' }] };
+  scout.api = async () => { calls++; return { ok: false, error: 'source returned 403' }; };
+  await scout.toggleSourcePanel('example', button);
+  await scout.toggleSourcePanel('example', button);
+  await scout.toggleSourcePanel('example', button);
+  assert.equal(calls, 2);
+});
+
 test('custom CV recommendations are preselected but remain optional', () => {
   const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
   assert.match(html, /id="cv-option-xyz"[^>]*checked/);

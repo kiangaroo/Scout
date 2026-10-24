@@ -6,6 +6,8 @@ This file contains public architecture only. Private hostnames, account identiti
 
 ## System map
 
+Source previews fetch at most three saved HTTP(S) links sequentially through the existing public-resource safety boundary, with the existing per-request timeout, redirect and response-size limits. Cache identity includes the saved URL list. Failed sources do not establish vacancy closure. Employer/title search links are user-triggered browser navigation only; search results never overwrite tracker facts or establish live availability.
+
 | System | Purpose | Authority |
 | --- | --- | --- |
 | Public Scout application repository | UI, server, providers, installers, templates, tests, public documentation, and release workflow | Authoritative for application code |

@@ -350,7 +350,15 @@ const Scout = {
     }
   },
   primarySource(e) {
-    return (e.sources && e.sources[0]) ? this.safeHref(e.sources[0]) : '';
+    return (Array.isArray(e?.sources) ? e.sources : []).map((url) => this.safeHref(url)).find(Boolean) || '';
+  },
+  sourceRecoveryHtml(e) {
+    const label = (value) => String(value || '').replace(/["\r\n\t]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+    const company = label(e?.company);
+    const role = label(e?.role);
+    if (!company || !role || e?.opportunityKind === 'employer-prospect' || e?.type === 'employer-prospect') return '';
+    const href = this.safeHref(`https://www.google.com/search?q=${encodeURIComponent(`"${company}" "${role}"`)}`);
+    return `<p class="meta"><a href="${href}" target="_blank" rel="noopener noreferrer">Search for this job ↗</a> — opens Google with the employer and title. Results are not verified; check the employer, location, closing date and job reference before using another advert.</p>`;
   },
 
   async loadOpportunities({ durableRuns: suppliedRuns, durableQueue: suppliedQueue } = {}) {
@@ -1303,19 +1311,20 @@ const Scout = {
     let r;
     try { r = await this.api(`/api/source?id=${encodeURIComponent(id)}`); }
     catch { r = { ok: false, error: 'request failed' }; }
-    body.dataset.loaded = '1';
-    body.innerHTML = this.sourceBodyHtml(r);
+    if (r?.ok === true) body.dataset.loaded = '1';
+    const entry = (this.state.data?.opportunities || []).find((e) => e.id === id);
+    body.innerHTML = this.sourceBodyHtml(r, entry);
   },
 
-  sourceBodyHtml(r) {
-    const fallback = `<div class="meta">couldn't read this page - open the source instead`;
+  sourceBodyHtml(r, entry) {
+    const fallback = `<div class="meta">Scout couldn't read the saved source. A blocked or failed link does not prove the vacancy is closed`;
     if (!r || typeof r !== 'object' || r.ok !== true) {
       const reason = r && r.error ? ` (${this.esc(r.error)})` : '';
-      return `${fallback}${reason}</div>`;
+      return `${fallback}${reason}. Try opening a saved source in your browser or search for the job elsewhere.</div>${this.sourceRecoveryHtml(entry)}`;
     }
     let host = '';
     try { host = new URL(r.url).hostname; } catch { /* leave blank */ }
-    const stamp = `<div class="meta">fetched ${this.esc(new Date(r.fetchedAt).toLocaleTimeString())}${host ? ` from ${this.esc(host)}` : ''}</div>`;
+    const stamp = `<div class="meta">fetched ${this.esc(new Date(r.fetchedAt).toLocaleTimeString())}${host ? ` from ${this.esc(host)}` : ''}${r.fallbackUsed ? ' — used a saved alternative source' : ''}</div>`;
     const factLabels = {
       title: 'title', salary: 'salary', location: 'location',
       employmentType: 'type', workMode: 'work mode',
@@ -1391,15 +1400,15 @@ const Scout = {
     const hasOutreach = (cvFiles.outreach || []).includes(slug);
     const applied = ['applied', 'interviewing', 'accepted'].includes(e.status);
     const prepRecommended = this.interviewPrepRecommended(e.id);
-    const extraSources = (e.sources || []).slice(1)
-      .map((s) => this.safeHref(s)).filter(Boolean)
-      .map((href, i) => `<a href="${href}" target="_blank" rel="noopener">source ${i + 2}</a>`)
+    const extraSources = [...new Set((e.sources || []).map((s) => this.safeHref(s)).filter(Boolean))]
+      .map((href, i) => `<a href="${href}" target="_blank" rel="noopener noreferrer">saved source ${i + 1}</a>`)
       .join(' - ');
-    const sourcePanel = this.primarySource(e)
+    const sourcePanel = this.primarySource(e) || this.sourceRecoveryHtml(e)
       ? `<div class="label">source</div>
          <div class="source-panel">
            <button class="act" data-action="toggle-source" data-id="${this.esc(e.id)}">show what the source says</button>
            ${extraSources ? `<span class="meta"> ${extraSources}</span>` : ''}
+           ${this.sourceRecoveryHtml(e)}
            <div class="source-body" style="display:none"></div>
          </div>`
       : '';

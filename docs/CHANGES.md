@@ -2,6 +2,8 @@
 
 ## Fixed
 
+- Job source previews try up to three saved alternatives after a fetch failure, label fallback use, and allow retrying a failed preview. Job details provide a user-triggered employer/title web search without treating results as verified vacancies.
+
 - Retain structured advert pay, working pattern, contract, hours and explicit weekly office-day facts, with estimates and unknowns labelled in job details.
 - Restore missing facts for existing jobs from retained scan evidence without changing decisions or making another source/model request. Cached evidence is not a fresh availability check.
 - Add researched, unscored employer prospects through Speculative. Saving one does not send an enquiry or silently enable employer crawling. Prospects are excluded from vacancy liveness checks.

@@ -35,8 +35,8 @@ import { scanEstimate } from './lib/scanEstimate.mjs';
 import { createProviderHealthMonitor, scheduleStatus, scheduleSummary } from './lib/scheduler.mjs';
 import { loadPortals, portalSummary } from './lib/ats.mjs';
 import { JOB_CATEGORIES } from './lib/filters.mjs';
-import { buildSourcePayload, sourceUrlOf, SourceCache } from './lib/source.mjs';
-import { fetchPublicResource, PublicHttpError } from './lib/publicHttp.mjs';
+import { fetchEntrySource, sourceUrlsOf, SourceCache } from './lib/source.mjs';
+import { fetchPublicResource } from './lib/publicHttp.mjs';
 import {
   assertSafeModel, detectProvidersAsync, providerLocalHealthSignal, runProviderCommand,
 } from './lib/providers.mjs';
@@ -1234,38 +1234,14 @@ async function handleSource(res, id) {
     return sendJson(res, 500, publicApiError('Tracker could not be read.'));
   }
   if (!entry) return sendJson(res, 404, { error: 'no such opportunity' });
-  const target = sourceUrlOf(entry);
-  if (!target) return sendJson(res, 404, { error: 'no usable source url' });
-  const cached = sourceCache.get(id);
+  const sources = sourceUrlsOf(entry);
+  if (!sources.length) return sendJson(res, 404, { error: 'no usable source url' });
+  const cacheKey = JSON.stringify([id, sources]);
+  const cached = sourceCache.get(cacheKey);
   if (cached) return sendJson(res, 200, cached);
-  let html;
-  try {
-    const r = await fetchPublicResource(target, {
-      timeoutMs: 10000,
-      maxBytes: 1_000_000,
-      maxRedirects: 4,
-      allowedContentTypes: ['text/html', 'application/xhtml+xml', 'application/xml', 'text/plain'],
-      headers: {
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
-        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
-    });
-    if (!r.ok) return sendJson(res, 502, { ok: false, error: `source returned ${r.status}` });
-    html = await r.text();
-  } catch (e) {
-    return sendJson(res, 502, {
-      ok: false,
-      ...(e instanceof PublicHttpError && e.reasonCode === 'request-timeout'
-        ? { error: 'Source request timed out.', reasonCode: 'source-timeout' }
-        : {
-          error: 'Source could not be fetched.',
-          reasonCode: e instanceof PublicHttpError ? e.reasonCode : 'source-fetch-failed',
-        }),
-    });
-  }
-  const payload = buildSourcePayload(html, target, new Date().toISOString());
-  sourceCache.set(id, payload);
-  return sendJson(res, 200, payload);
+  const { status, payload } = await fetchEntrySource(entry, { fetchResource: fetchPublicResource });
+  if (status === 200) sourceCache.set(cacheKey, payload);
+  return sendJson(res, status, payload);
 }
 
 export function createServer() {

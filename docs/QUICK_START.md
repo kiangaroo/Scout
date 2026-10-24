@@ -149,6 +149,12 @@ Expand a job to see **Advert facts and checks**. Scout retains bounded structure
 
 For older saved jobs, select **Restore facts from saved scans**. This repairs matching jobs from retained scan artifacts without another source request or AI call. It preserves status, scores, notes, contacts, commute and application history. The evidence date is the original capture date, not a fresh availability check. Old or unreadable evidence may be unavailable. Use **show what the source says** and the original advert for remaining gaps; blocked pages are not bypassed.
 
+### When an advert link fails
+
+Expand the job and open **source**. All saved source links are listed; the text preview tries up to three saved links in order. It labels a successful alternative and reports HTTP errors and timeouts separately from other fetch failures. Close and reopen a failed preview to retry.
+
+Use **Search for this job** to open Google with only the public employer and job title. Scout does not search automatically or send your CV, profile or notes. Compare the employer, location, closing date and job reference before trusting another result: reposts may be old or refer to a different vacancy. A blocked source does not prove a job is closed. Scout does not bypass access controls or automatically replace source links with search results.
+
 ### Use Speculative for employer prospects
 
 **Speculative** holds researched employers you might approach even when no suitable vacancy is confirmed. Ordinary vacancy scans do not automatically generate these prospects.
