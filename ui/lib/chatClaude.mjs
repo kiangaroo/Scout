@@ -3,12 +3,23 @@ import { assertSafeModel, providerCommand } from './providers.mjs';
 const SESSION_ID = /^[A-Za-z0-9-]+$/;
 
 export function buildClaudeArgs(resumeId, options = {}) {
-  const permissionMode = options.permissionMode || 'acceptEdits';
-  if (!['acceptEdits', 'auto'].includes(permissionMode)) throw new Error(`invalid Claude permission mode: ${permissionMode}`);
+  const permissionMode = options.readOnlyResearch ? 'dontAsk' : options.permissionMode || 'acceptEdits';
+  if (!['acceptEdits', 'auto'].includes(permissionMode) && !(options.readOnlyResearch && permissionMode === 'dontAsk')) {
+    throw new Error(`invalid Claude permission mode: ${permissionMode}`);
+  }
   const args = [
     '-p', '--output-format', 'stream-json', '--verbose',
     '--permission-mode', permissionMode,
   ];
+  if (options.readOnlyResearch) {
+    args.push(
+      '--tools', 'Read,Glob,Grep,WebSearch,WebFetch',
+      '--allowedTools', 'Read,Glob,Grep,WebSearch,WebFetch',
+      '--strict-mcp-config',
+      '--disable-slash-commands',
+      '--settings', JSON.stringify({ disableAllHooks: true }),
+    );
+  }
   const model = assertSafeModel(options.model);
   if (model) args.push('--model', model);
   if (resumeId) {

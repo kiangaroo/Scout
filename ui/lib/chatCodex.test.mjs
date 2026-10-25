@@ -2,6 +2,25 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildCodexArgs, parseCodexLine } from './chatCodex.mjs';
 
+test('application research can request live web search for one fresh or resumed turn', () => {
+  for (const session of [null, 'existing-thread']) {
+    const researched = buildCodexArgs(session, { webSearch: true, platform: 'linux' });
+    assert.deepEqual(researched.args.slice(0, 2), ['--search', 'exec']);
+    assert.equal(researched.args.filter((arg) => arg === '--search').length, 1);
+    assert.equal(buildCodexArgs(session, { platform: 'linux' }).args.includes('--search'), false);
+  }
+});
+
+test('research is read-only and does not inherit user configuration or rules', () => {
+  for (const session of [null, 'research-thread']) {
+    const { args } = buildCodexArgs(session, { readOnlyResearch: true, webSearch: true, platform: 'linux' });
+    assert.equal(args[args.indexOf('--sandbox') + 1], 'read-only');
+    assert.ok(args.includes('--ignore-user-config'));
+    assert.ok(args.includes('--ignore-rules'));
+    assert.equal(args.includes('workspace-write'), false);
+  }
+});
+
 test('buildCodexArgs: fresh session reads prompt from stdin', () => {
   assert.deepEqual(buildCodexArgs(null, { platform: 'linux' }), {
     command: process.platform === 'win32' ? 'codex.cmd' : 'codex',

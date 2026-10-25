@@ -1436,6 +1436,7 @@ const Scout = {
         <button class="act" data-action="open-company-history" data-id="${this.esc(e.id)}">company history</button>
         <button class="act" data-action="record-feedback" data-id="${this.esc(e.id)}">record feedback</button>
         <button class="act bridge" data-action="open-chat" data-id="${this.esc(e.id)}" data-prefill="fit">fit and evidence gaps</button>
+        <button class="act bridge" data-action="open-chat" data-id="${this.esc(e.id)}" data-prefill="applicationApproach">research my application approach</button>
         <button class="act bridge" data-action="open-chat" data-id="${this.esc(e.id)}" data-prefill="ask">ask about this job</button>
         <button class="act${prepRecommended ? ' bridge' : ''}" data-action="open-interview-prep" data-id="${this.esc(e.id)}">interview prep</button>
       </div>`;
@@ -2161,10 +2162,11 @@ const Scout = {
       prefills: r.prefills || {},
       purpose: r.purpose || purpose,
       artifact: r.artifact || null,
+      applicationApproach: r.applicationApproach || null,
       streaming: !!r.busy,
       recovering: !!r.busy,
       pollTimer: null,
-      mode: prefillKey === 'fit' ? 'fit-assessment' : null,
+      mode: prefillKey === 'fit' ? 'fit-assessment' : prefillKey === 'applicationApproach' ? 'application-approach' : null,
     };
     this.chat = c;
     this.enginePicks = {};
@@ -2220,6 +2222,7 @@ const Scout = {
     c.engine = r.chat ? r.chat.engine : c.engine;
     c.prefills = r.prefills || c.prefills;
     c.artifact = r.artifact || c.artifact;
+    c.applicationApproach = r.applicationApproach || c.applicationApproach;
     c.streaming = false;
     c.recovering = false;
     this.renderChatDrawer();
@@ -2266,6 +2269,11 @@ const Scout = {
       </div>
       <div class="chat-companion">${scoutMarkup(c.streaming ? 'thinking' : 'listening')}<div class="scout-bubble tail-left"><span id="scout-chat-status">${c.streaming ? 'I’m thinking…' : prep ? 'Build your prep pack, refresh research, or practise here.' : 'Ask me anything about this opportunity.'}</span></div></div>
       ${prepControls}
+      ${!prep && (c.mode === 'application-approach' || c.applicationApproach?.exists) ? `<div class="controls" style="padding:8px 12px;flex-wrap:wrap">
+        <button class="act bridge" data-action="use-approach-prompt" data-prompt="applicationApproach">research / refresh plan</button>
+        ${c.applicationApproach?.exists ? '<button class="act" data-action="use-approach-prompt" data-prompt="approachDraft">draft a chosen idea</button>' : ''}
+        <span class="meta">Choose an engine and send the request when ready. Research creates a plan; nothing is sent to employers.</span>
+      </div>` : ''}
       <div id="chat-body" class="chat-body">${c.engine ? '' : picker}</div>
       <div class="chat-foot" ${c.engine ? '' : 'style="display:none"'}>
         <textarea id="chat-input" placeholder="message ${this.esc(c.engine || '')} - Enter sends, Shift+Enter for a new line" data-keydown-action="chat-key"></textarea>
@@ -2643,6 +2651,7 @@ const Scout = {
     body.innerHTML = this.chat.data.messages.map((m) => this.chatBubble(m.role, m.text)).join('')
       + this.cvLinkHtml()
       + this.interviewPrepPackHtml()
+      + this.applicationApproachHtml()
       + (this.chat.engine ? '' : this.chatPickerHtml());
     body.scrollTop = body.scrollHeight;
   },
@@ -2673,6 +2682,39 @@ const Scout = {
     }
     const updated = artifact.updatedAt ? ` - updated ${this.esc(new Date(artifact.updatedAt).toLocaleString())}` : '';
     return `<div class="chat-msg system"><details><summary>View prep pack${updated}</summary><pre style="white-space:pre-wrap">${this.esc(artifact.content || '')}</pre></details></div>`;
+  },
+
+  applicationApproachHtml() {
+    if (this.chat?.purpose !== 'job') return '';
+    const plan = this.chat.applicationApproach;
+    if (plan?.error) return `<div class="chat-msg system">${this.esc(plan.error)}</div>`;
+    if (!plan?.exists) return this.chat.mode === 'application-approach'
+      ? '<div class="chat-msg system">No application plan saved yet. Send the research request to generate one. Creating materials requires your separate choice.</div>' : '';
+    const updated = plan.updatedAt ? ` — updated ${this.esc(new Date(plan.updatedAt).toLocaleString())}` : '';
+    return `<div class="chat-msg system"><details><summary>View application plan${updated}</summary><pre style="white-space:pre-wrap">${this.esc(plan.content || '')}</pre>${this.approachSourceLinksHtml(plan.content)}</details></div>`;
+  },
+
+  approachSourceLinksHtml(content) {
+    const urls = new Set();
+    for (const raw of String(content || '').match(/https?:\/\/[^\s<>"\])]+/g) || []) {
+      try {
+        const url = new URL(raw.replace(/[.,;]+$/, ''));
+        if (url.username || url.password || url.href.length > 2000) continue;
+        urls.add(url.href);
+        if (urls.size >= 12) break;
+      } catch { /* an incomplete citation remains visible in the plan text */ }
+    }
+    return urls.size ? `<div class="meta">Links in this plan: ${[...urls].map((url, i) => `<a href="${this.safeHref(url)}" target="_blank" rel="noopener noreferrer">source ${i + 1}</a>`).join(' · ')}</div>` : '';
+  },
+
+  useApproachPrompt(key) {
+    const c = this.chat;
+    if (!c || c.purpose !== 'job' || c.streaming || !['applicationApproach', 'approachDraft'].includes(key)) return;
+    const input = document.getElementById('chat-input');
+    if (!input) return;
+    c.mode = key === 'applicationApproach' ? 'application-approach' : null;
+    input.value = c.prefills[key] || '';
+    input.focus();
   },
 
   usePrepPrompt(key) {
@@ -2799,6 +2841,7 @@ const Scout = {
           );
           c.data.cliSessionId = data.sessionId;
           if (data.filesTouched) c.data.filesTouched = data.filesTouched;
+          if (data.applicationApproach) c.applicationApproach = data.applicationApproach;
         }
         if (event === 'error') {
           this.setChatScoutState('warning', 'I hit a problem, but your completed work is safe.');
@@ -3097,6 +3140,7 @@ const Scout = {
       case 'run-cv-quality-review': return this.runCvQualityReview();
       case 'review-evidence-for-master': return this.reviewEvidenceForMaster();
       case 'use-prep-prompt': return this.usePrepPrompt(prompt);
+      case 'use-approach-prompt': return this.useApproachPrompt(prompt);
       case 'handoff-chat': return this.handoffChat();
       case 'open-codex-task': return this.openCodexTask();
       case 'copy-codex-task': return this.copyCodexTask();

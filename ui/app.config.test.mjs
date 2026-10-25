@@ -30,6 +30,55 @@ function loadScout() {
   return { scout: context.window.Scout, context };
 }
 
+test('application approach opens the existing job chat with a research draft but no automatic send', async () => {
+  const { scout, context } = loadScout();
+  const input = { value: '' };
+  context.document = { getElementById: () => input, querySelectorAll: () => [] };
+  const calls = [];
+  scout.api = async (url) => { calls.push(url); return { purpose: 'job', chat: null, prefills: { applicationApproach: 'Research the selected role' }, applicationApproach: { exists: false } }; };
+  scout.renderChatDrawer = () => {};
+  scout.closeCompanyHistory = () => {};
+  scout.loadEngineOptions = () => {};
+  scout.refreshUsage = () => {};
+  scout.refreshCodexDeepLink = () => {};
+  scout.sendChat = () => { throw Error('Opening must not spend a provider turn'); };
+  await scout.openChat('example-role', 'applicationApproach');
+  assert.equal(scout.chat.purpose, 'job');
+  assert.equal(scout.chat.mode, 'application-approach');
+  assert.equal(input.value, 'Research the selected role');
+  assert.deepEqual(calls, ['/api/chat?id=example-role']);
+  const html = scout.detailHtml({ id: 'example-role', company: 'Example', role: 'Editor', sources: [], status: 'new' });
+  assert.match(html, /data-prefill="applicationApproach"/);
+  assert.match(html, /research my application approach/i);
+});
+
+test('saved application plans are escaped and idea drafting is an explicit separate choice', () => {
+  const { scout, context } = loadScout();
+  const input = { value: '', focus() {} };
+  context.document = { getElementById: () => input };
+  scout.chat = { purpose: 'job', mode: null, streaming: false, applicationApproach: { exists: true, content: '<script>bad()</script>', updatedAt: null }, prefills: { applicationApproach: 'Research again', approachDraft: 'Ask which idea I choose' } };
+  const html = scout.applicationApproachHtml();
+  assert.match(html, /View application plan/);
+  assert.match(html, /&lt;script&gt;/);
+  assert.doesNotMatch(html, /<script>/);
+  scout.useApproachPrompt('approachDraft');
+  assert.equal(scout.chat.mode, null);
+  assert.equal(input.value, 'Ask which idea I choose');
+  scout.useApproachPrompt('applicationApproach');
+  assert.equal(scout.chat.mode, 'application-approach');
+  assert.equal(input.value, 'Research again');
+  scout.chat.purpose = 'interview-prep';
+  assert.equal(scout.applicationApproachHtml(), '');
+});
+
+test('application plan source links are clickable public HTTP URLs without embedded credentials', () => {
+  const { scout } = loadScout();
+  const html = scout.approachSourceLinksHtml('[Official role](https://example.test/job?id=4&lang=en) https://example.test/job?id=4&lang=en https://user:secret@unsafe.test/job javascript:alert(1)');
+  assert.match(html, /href="https:\/\/example.test\/job\?id=4&amp;lang=en"/);
+  assert.equal((html.match(/<a /g) || []).length, 1);
+  assert.doesNotMatch(html, /secret|javascript:/);
+});
+
 test('source recovery searches only the public employer and role and explains uncertainty', () => {
   const { scout } = loadScout();
   const entry = { company: 'Example & Co', role: 'Editor "Food"', notes: 'PRIVATE-NOTES', contacts: [{ email: 'PRIVATE-EMAIL' }], sources: ['javascript:alert(1)', 'https://example.test/jobs/17'] };

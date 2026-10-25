@@ -2,6 +2,8 @@
 
 ## Fixed
 
+- Add **research my application approach** to job details: a user-started research turn in the existing job chat, with a saved per-opportunity plan, evidence and effort guidance, and separate drafting choices. Research uses read-only provider controls; failed or empty results preserve the previous plan.
+
 - Job source previews try up to three saved alternatives after a fetch failure, label fallback use, and allow retrying a failed preview. Job details provide a user-triggered employer/title web search without treating results as verified vacancies.
 
 - Retain structured advert pay, working pattern, contract, hours and explicit weekly office-day facts, with estimates and unknowns labelled in job details.

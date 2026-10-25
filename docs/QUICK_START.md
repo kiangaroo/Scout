@@ -149,6 +149,15 @@ Expand a job to see **Advert facts and checks**. Scout retains bounded structure
 
 For older saved jobs, select **Restore facts from saved scans**. This repairs matching jobs from retained scan artifacts without another source request or AI call. It preserves status, scores, notes, contacts, commute and application history. The evidence date is the original capture date, not a fresh availability check. Old or unreadable evidence may be unavailable. Use **show what the source says** and the original advert for remaining gaps; blocked pages are not bypassed.
 
+### Research an application approach
+
+1. Expand a job and select **research my application approach**. This opens the existing job chat with a prepared request; opening it does not call a model.
+2. Choose an available provider/model and send when ready. Research uses your existing provider allowance. No additional research account or API key is required.
+3. Review the recommended route and up to two worthwhile alternatives: evidence links and dates, confirmed facts versus inference, employer restrictions, material to reuse, estimated preparation time and unresolved questions. A normal application may be the best route. Ideas default to 30 minutes or less of your preparation time; AI runtime is not promised.
+4. Reopen the job chat and expand **View application plan** to read the saved plan. **research / refresh plan** prepares a new research request; **draft a chosen idea** prepares a separate conversation asking which idea you choose. Review and send either request yourself. Creating a plan never automatically creates application materials or sends anything.
+
+Plans are stored separately for each opportunity at `applications/<opportunity-id>/application-approach.md`. Successful research replaces that role's saved plan; failed, empty or oversized responses preserve its previous plan. Research providers can read and search but cannot edit workspace files through their research tools; Scout saves the returned plan atomically. Sources may still be blocked or unavailable and must be labelled unverified. Check employer recruitment and AI-use policies before using a proposed idea.
+
 ### When an advert link fails
 
 Expand the job and open **source**. All saved source links are listed; the text preview tries up to three saved links in order. It labels a successful alternative and reports HTTP errors and timeouts separately from other fetch failures. Close and reopen a failed preview to retry.

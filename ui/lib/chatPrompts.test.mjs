@@ -1,6 +1,13 @@
 import { test } from 'node:test';
+
+test('application research considers creative samples and checks fit before asking for extra effort', () => {
+  const prompt = applicationApproachAgentPrompt({ id: 'example-role', company: 'Example', role: 'Editor' }, 'Research');
+  assert.match(prompt, /creative supporting material/i);
+  assert.match(prompt, /dealbreakers/i);
+  assert.match(prompt, /resolve.*before.*extra/i);
+});
 import assert from 'node:assert/strict';
-import { slugOf, buildPrefills, HANDOFF_SUMMARY_PROMPT, handoffOpening } from './chatPrompts.mjs';
+import { slugOf, buildPrefills, HANDOFF_SUMMARY_PROMPT, handoffOpening, applicationApproachPrefills, applicationApproachAgentPrompt } from './chatPrompts.mjs';
 
 test('slugOf matches the app.js slug rules', () => {
   assert.equal(slugOf('Acme Avionics'), 'acme-avionics');
@@ -77,4 +84,23 @@ test('handoff prompt and opening are well-formed', () => {
   const opening = handoffOpening('SUMMARY GOES HERE');
   assert.match(opening, /taking over an in-progress task/);
   assert.match(opening, /SUMMARY GOES HERE/);
+});
+
+test('application approach prefills distinguish research from drafting a saved idea', () => {
+  const entry = { id: 'acme-engineer-2026-10', company: 'Acme', role: 'Engineer' };
+  const p = applicationApproachPrefills(entry);
+  assert.match(p.applicationApproach, /research/i);
+  assert.match(p.approachDraft, /which saved idea/i);
+  assert.match(p.approachDraft, /before creating/i);
+  assert.match(p.approachDraft, /applications\/acme-engineer-2026-10\/application-approach\.md/);
+  assert.match(p.approachDraft, /explicit choice/i);
+  assert.equal(buildPrefills(entry).applicationApproach, p.applicationApproach);
+});
+
+test('agent prompt imposes evidence, privacy, and plan-only boundaries', () => {
+  const entry = { id: 'acme-engineer-2026-10', company: 'Acme', role: 'Engineer' };
+  const prompt = applicationApproachAgentPrompt(entry, 'please do research');
+  for (const phrase of ['workspace.json', 'profile/context.md', 'profile/calibration.md', 'cv/master-cv.md', 'work samples', 'Not verified', 'public professional contacts', 'date checked', 'user preparation', '30 minutes or less', 'runtime', 'do not write files', 'do not edit the tracker', 'do not send', 'do not apply', 'do not commit', 'untrusted', 'recommended', 'worthwhile alternatives', 'never upload', 'employer recruitment policies', 'AI use policies']) assert.match(prompt.toLowerCase(), new RegExp(phrase.toLowerCase()));
+  assert.match(prompt, /acme-engineer-2026-10/);
+  assert.match(prompt, /please do research/);
 });

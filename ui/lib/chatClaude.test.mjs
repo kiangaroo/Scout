@@ -2,6 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildClaudeArgs, parseClaudeLine } from './chatClaude.mjs';
 
+test('research authorises only its bounded read and web tools under dontAsk', () => {
+  const { args } = buildClaudeArgs(null, { readOnlyResearch: true });
+  assert.equal(args[args.indexOf('--allowedTools') + 1], 'Read,Glob,Grep,WebSearch,WebFetch');
+});
+
 test('buildClaudeArgs: fresh session', () => {
   assert.deepEqual(buildClaudeArgs(null), {
     command: process.platform === 'win32' ? 'claude.cmd' : 'claude',
@@ -77,4 +82,22 @@ test('parseClaudeLine: malformed and unknown lines yield []', () => {
   assert.deepEqual(parseClaudeLine('not json {'), []);
   assert.deepEqual(parseClaudeLine(''), []);
   assert.deepEqual(parseClaudeLine(JSON.stringify({ type: 'user' })), []);
+});
+test('buildClaudeArgs: read-only research fresh session is restricted to read and public web tools', () => {
+  const args = buildClaudeArgs(null, { readOnlyResearch: true }).args;
+  assert.deepEqual(args, [
+    '-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'dontAsk',
+    '--tools', 'Read,Glob,Grep,WebSearch,WebFetch', '--allowedTools', 'Read,Glob,Grep,WebSearch,WebFetch', '--strict-mcp-config',
+    '--disable-slash-commands', '--settings', JSON.stringify({ disableAllHooks: true }),
+  ]);
+});
+
+test('buildClaudeArgs: read-only research restrictions persist on resume', () => {
+  const args = buildClaudeArgs('abc-123-DEF', { readOnlyResearch: true }).args;
+  assert.deepEqual(args.slice(0, 14), [
+    '-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'dontAsk',
+    '--tools', 'Read,Glob,Grep,WebSearch,WebFetch', '--allowedTools', 'Read,Glob,Grep,WebSearch,WebFetch', '--strict-mcp-config',
+    '--disable-slash-commands', '--settings', JSON.stringify({ disableAllHooks: true }),
+  ]);
+  assert.deepEqual(args.slice(-2), ['--resume', 'abc-123-DEF']);
 });

@@ -7,7 +7,9 @@ import {
 import { buildClaudeArgs, parseClaudeLine } from './chatClaude.mjs';
 import { buildCodexArgs, parseCodexLine } from './chatCodex.mjs';
 import { runTurn } from './chatRun.mjs';
-import { buildPrefills, HANDOFF_SUMMARY_PROMPT, handoffOpening, slugOf } from './chatPrompts.mjs';
+import {
+  applicationApproachAgentPrompt, buildPrefills, HANDOFF_SUMMARY_PROMPT, handoffOpening, slugOf,
+} from './chatPrompts.mjs';
 import { runCvQuality } from './cvQuality.mjs';
 import { artifactSlugFor, chooseArtifactSlug } from './cvArtifacts.mjs';
 import { listCvFiles } from './cv.mjs';
@@ -28,6 +30,7 @@ import {
 import {
   interviewPrepAgentPrompt, interviewPrepPrefills, readInterviewPrep,
 } from './interviewPrep.mjs';
+import { readApplicationApproach, writeApplicationApproach } from './applicationApproach.mjs';
 
 export const ENGINES = {
   claude: { build: buildClaudeArgs, parse: parseClaudeLine },
@@ -199,7 +202,7 @@ export function registerChatRoutes({
       release: releaseProviderWorkFn,
     });
   }
-  async function runEditableProviderTurn(id, phase, start) {
+  async function runEditableProviderTurn(id, phase, start, onResult = null) {
     let turn = null;
     const result = await withWorkspaceMutationAuthorityAsyncFn(repoRoot, {
       kind: 'chat-provider', phase,
@@ -225,7 +228,9 @@ export function registerChatRoutes({
           childOperation = null;
         }
         running.set(id, turn);
-        return await turn.finished;
+        const finished = await turn.finished;
+        if (onResult) await onResult(finished);
+        return finished;
       } finally {
         if (childOperation !== null) coordinator.finishChild(childOperation);
       }
@@ -250,11 +255,13 @@ export function registerChatRoutes({
     return { config, status, model: modelOverride || modelForProvider(config, engine) };
   }
 
-  function engineBuild(engine, resumeId, modelOverride = null) {
+  function engineBuild(engine, resumeId, modelOverride = null, research = false) {
     const { status, model } = engineStatus(engine, modelOverride);
     return ENGINES[engine].build(resumeId, {
       model, command: status.executable, env: status.env,
       ...(engine === 'codex' ? { reasoningEffort: 'medium' } : {}),
+      ...(research ? { readOnlyResearch: true } : {}),
+      ...(engine === 'codex' && research ? { webSearch: true } : {}),
     });
   }
   function turnStartMessage(error, fallback) {
@@ -351,6 +358,16 @@ export function registerChatRoutes({
     // but expose an unset engine so the other installed CLI remains selectable.
     const visibleChat = chat && !chat.cliSessionId && !chat.bounded ? { ...chat, engine: null } : chat;
     const config = loadWorkspaceConfig(repoRoot);
+    let applicationApproach = null;
+    if (purpose === 'job' && id !== ONBOARDING_CHAT_ID) {
+      try { applicationApproach = readApplicationApproach(repoRoot, entry); }
+      catch {
+        applicationApproach = {
+          exists: false,
+          error: 'Saved application plan could not be read; preserved.',
+        };
+      }
+    }
     const cvOptions = {
       xyz: url.searchParams.get('xyz') !== '0',
       humanize: url.searchParams.get('humanize') !== '0',
@@ -360,6 +377,7 @@ export function registerChatRoutes({
       chat: visibleChat,
       purpose,
       artifact: purpose === 'interview-prep' ? readInterviewPrep(repoRoot, entry) : null,
+      applicationApproach,
       prefills: id === ONBOARDING_CHAT_ID
         ? { ask: onboardingPrefill(config), review: 'Review the currently staged onboarding changes. Summarise each proposed change, flag any unsupported claims or missing evidence, and do not activate anything.', approve: 'I have reviewed the staged onboarding changes. Validate them once more, show me the exact files that will be activated, and ask for final confirmation before activation.' }
         : purpose === 'interview-prep'
@@ -630,6 +648,10 @@ export function registerChatRoutes({
     try { entry = entryOf(id); } catch { return replyJson(res, 500, { error: 'Tracker could not be read.' }); }
     if (!entry) return replyJson(res, 404, { error: 'no such opportunity' });
     if (id === ONBOARDING_CHAT_ID) return replyJson(res, 410, { error: 'use Scout’s bounded setup proposal control for onboarding' });
+    if (b.mode === 'application-approach' && (purpose !== 'job'
+      || entry.opportunityKind === 'onboarding' || entry.type === 'onboarding')) {
+      return replyJson(res, 400, { error: 'application approach is available only for a job conversation' });
+    }
     if (running.has(id)) return replyJson(res, 409, { error: 'a turn is already running for this job' });
     let chat;
     try { chat = loadChat(repoRoot, id, purpose); } catch { return replyJson(res, 400, { error: 'Chat history could not be read.' }); }
@@ -655,7 +677,7 @@ export function registerChatRoutes({
     let providerWork;
     try {
       providerWork = superviseProviderWork(engine);
-      built = engineBuild(engine, chat.cliSessionId, model);
+      built = engineBuild(engine, chat.cliSessionId, model, b.mode === 'application-approach');
     } catch (e) {
       if (providerWork) await providerWork.release();
       sseSend(res, 'error', {
@@ -670,14 +692,17 @@ export function registerChatRoutes({
     let r;
     let healthResult;
     let lifecycleError = null;
+    let approachSaveError = null;
     try {
-      const execution = await runEditableProviderTurn(id, 'chat-edit', () => {
+      const execution = await runEditableProviderTurn(id, b.mode === 'application-approach' ? 'application-approach' : 'chat-edit', () => {
         turn = runTurnFn({
           ...built,
           prompt: entry.id === ONBOARDING_CHAT_ID
             ? text
             : purpose === 'interview-prep'
               ? `${selectedEntryContext(entry)}\n\n${interviewPrepAgentPrompt(entry, text)}`
+              : b.mode === 'application-approach'
+                ? `${selectedEntryContext(entry)}\n\n${applicationApproachAgentPrompt(entry, text)}`
               : `${selectedEntryContext(entry)}\n\nUser request:\n${text}`,
           cwd: repoRoot,
           parseLine: ENGINES[engine].parse,
@@ -689,7 +714,18 @@ export function registerChatRoutes({
         providerWork.setFailureHandler(() => turn.stop?.());
         stopTurnOnDisconnect(req, res, id);
         return turn;
-      });
+      }, b.mode === 'application-approach' ? async (finished) => {
+        const plan = typeof finished?.text === 'string' && finished.text.trim()
+          ? finished.text.trim()
+          : assistantUpdates(finished).join('\n\n').trim();
+        if (!finished?.ok) return;
+        if (!plan) {
+          approachSaveError = 'The provider returned no plan; the previous saved plan remains unchanged.';
+          return;
+        }
+        try { await writeApplicationApproach(repoRoot, entry, plan); }
+        catch { approachSaveError = 'The approach plan could not be saved; the previous saved plan remains unchanged.'; }
+      } : null);
       r = execution.result;
       providerWork.assertCurrent();
       healthResult = r;
@@ -727,9 +763,25 @@ export function registerChatRoutes({
     checkpoint(`save chat - ${id}`);
 
     if (r.ok) {
-      sseSend(res, 'done', {
-        text: r.text, updates: assistantUpdates(r), sessionId: chat.cliSessionId, usage: r.usage, filesTouched: chat.filesTouched,
-      });
+      if (b.mode === 'application-approach' && approachSaveError) {
+        sseSend(res, 'error', { message: approachSaveError, sessionId: chat.cliSessionId, filesTouched: chat.filesTouched });
+      } else {
+        let applicationApproach = null;
+        if (b.mode === 'application-approach') {
+          try { applicationApproach = readApplicationApproach(repoRoot, entry); }
+          catch {
+            sseSend(res, 'error', {
+              message: 'The approach plan was generated, but its saved copy could not be reopened.',
+              sessionId: chat.cliSessionId, filesTouched: chat.filesTouched,
+            });
+            return sseEnd(res);
+          }
+        }
+        sseSend(res, 'done', {
+          text: r.text, updates: assistantUpdates(r), sessionId: chat.cliSessionId, usage: r.usage, filesTouched: chat.filesTouched,
+          ...(b.mode === 'application-approach' ? { applicationApproach } : {}),
+        });
+      }
     } else {
       sseSend(res, 'error', {
         message: safeTurnFailure(r).message,
