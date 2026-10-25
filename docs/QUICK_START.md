@@ -149,6 +149,14 @@ Expand a job to see **Advert facts and checks**. Scout retains bounded structure
 
 For older saved jobs, select **Restore facts from saved scans**. This repairs matching jobs from retained scan artifacts without another source request or AI call. It preserves status, scores, notes, contacts, commute and application history. The evidence date is the original capture date, not a fresh availability check. Old or unreadable evidence may be unavailable. Use **show what the source says** and the original advert for remaining gaps; blocked pages are not bypassed.
 
+### Add a job you found elsewhere
+
+In **Jobs**, select **Add job from URL**, paste the public vacancy link, and choose **Import and score**. Scout uses your configured AI provider and existing allowance to extract the listing and assess it against your current profile and CV. No additional account or key is required.
+
+The imported vacancy has the same shortlist, research, CV, cover-letter and interview tools as discovered jobs. A low assessment or a mismatch remains visible for your review; adding a job does not change your preferences or make unknown requirements pass. An existing job opens without overwriting your decisions or application history.
+
+Some sites block automated access or require sign-in. If Scout cannot read a usable advert, it offers a text fallback: paste the advert alongside its public URL and retry. Scout labels pasted evidence and unverified availability. Use a single vacancy page rather than a search-results page. No application or employer message is sent.
+
 ### Research an application approach
 
 If Scout is briefly finishing startup or backup work, research waits before starting the AI turn. If the workspace stays busy, retry after the update or scan completes. Closing or stopping a waiting request cancels it. A retry does not repeat an AI turn that has already started.

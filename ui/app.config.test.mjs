@@ -696,6 +696,238 @@ test('renderJobs lists only new jobs, highest score first, with tags and actions
   assert.doesNotMatch(html, /data-id="s"/); // speculative excluded
 });
 
+test('Jobs shows a compact listing URL import form and preserves its draft across rerender', () => {
+  const { scout, context } = loadScout();
+  const { doc, sections } = withJobsDom();
+  const input = { value: 'https://jobs.example/role' };
+  doc.getElementById = (id) => id === 'job-import-url' ? input : (sections[id] ||= { innerHTML: '', classList: { toggle() {} } });
+  context.document = doc;
+  scout.filterBar = () => '';
+  scout.latestScanCard = () => '';
+  scout.state.data = { opportunities: [], workspaceConfig: { ai: { provider: 'codex' } } };
+  scout.renderJobs();
+  const html = doc.getElementById('tab-jobs').innerHTML;
+  assert.match(html, /Add job from URL/);
+  assert.match(html, /id="job-import-url"[^>]*type="url"/);
+  assert.match(html, /Import and score/);
+  assert.match(html, /configured AI provider/);
+  assert.match(html, /usual research and CV tools/i);
+  assert.ok(html.includes('value="https://jobs.example/role"'));
+});
+
+test('delegated job import submit prevents navigation, posts the URL, and persists input drafts', async () => {
+  const { scout, context } = loadScout();
+  const sections = {};
+  const input = { id: 'job-import-url', value: 'https://jobs.example/role' };
+  const advert = { id: 'job-import-advert', value: 'Synthetic advert draft' };
+  const listeners = new Map();
+  const doc = {
+    addEventListener: (name, handler) => listeners.set(name, handler),
+    getElementById: (id) => id === 'job-import-url' ? input : id === 'job-import-advert' ? advert : (sections[id] ||= { innerHTML: '', classList: { toggle() {} } }),
+    querySelectorAll: () => [],
+  };
+  context.document = doc;
+  const stored = new Map();
+  context.localStorage = { getItem: (key) => stored.get(key) || null, setItem: (key, value) => stored.set(key, value) };
+  scout.state.data = { opportunities: [] };
+  scout.filterBar = () => '';
+  scout.latestScanCard = () => '';
+  scout.watchJobImport = (id) => { scout.watchedOperation = id; };
+  const calls = [];
+  context.fetch = async (url, options) => {
+    calls.push([url, options]);
+    return { ok: true, json: async () => ({ operation: { id: 'import-1' } }) };
+  };
+  scout.bindDelegatedActions();
+
+  listeners.get('input')({ target: input });
+  listeners.get('input')({ target: advert });
+  const saved = JSON.parse(stored.get(scout.jobImportStorageKey));
+  assert.equal(saved.url, input.value);
+  assert.equal(saved.pastedAdvert, advert.value);
+  assert.match(scout.jobImportFormHtml(), /data-submit-action="job-import"/);
+
+  let prevented = false;
+  await listeners.get('submit')({
+    target: { dataset: { submitAction: 'job-import' } },
+    preventDefault() { prevented = true; },
+  });
+  assert.equal(prevented, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], '/api/jobs/import');
+  assert.equal(calls[0][1].method, 'POST');
+  assert.deepEqual(JSON.parse(calls[0][1].body), { url: input.value, pastedAdvert: advert.value });
+  assert.equal(scout.watchedOperation, 'import-1');
+});
+
+test('job URL import sends once and keeps submission disabled while the request is pending', async () => {
+  const { scout, context } = loadScout();
+  const { doc, sections } = withJobsDom();
+  const input = { value: 'https://jobs.example/role' };
+  doc.getElementById = (id) => id === 'job-import-url' ? input : (sections[id] ||= { innerHTML: '', classList: { toggle() {} } });
+  context.document = doc;
+  scout.state.data = { opportunities: [] };
+  scout.filterBar = () => '';
+  scout.latestScanCard = () => '';
+  let release;
+  let posts = 0;
+  context.fetch = (url, options) => {
+    posts += 1;
+    assert.equal(url, '/api/jobs/import');
+    assert.deepEqual(JSON.parse(options.body), { url: input.value });
+    return new Promise((resolve) => { release = resolve; });
+  };
+  let watched;
+  scout.watchJobImport = (id) => { watched = id; };
+  scout.renderJobs();
+  const pending = scout.importJobFromUrl();
+  await Promise.resolve();
+  await scout.importJobFromUrl();
+  assert.equal(posts, 1);
+  assert.equal(scout.jobImportBusy, true);
+  assert.match(sections['tab-jobs'].innerHTML, /Importing…/);
+  assert.match(sections['tab-jobs'].innerHTML, /disabled/);
+  release({ ok: true, json: async () => ({ operation: { id: 'import-1' } }) });
+  await pending;
+  assert.equal(watched, 'import-1');
+});
+
+test('job import offers pasted-advert fallback only for a blocked public fetch', async () => {
+  for (const reasonCode of ['source-unavailable', 'provider-error']) {
+    const { scout, context } = loadScout();
+    const { doc, sections } = withJobsDom();
+    doc.getElementById = (id) => sections[id] ||= { innerHTML: '', classList: { toggle() {} } };
+    context.document = doc;
+    scout.state.data = { opportunities: [] };
+    scout.filterBar = () => '';
+    scout.latestScanCard = () => '';
+    let timer;
+    context.setTimeout = (fn) => { timer = fn; return 1; };
+    context.clearTimeout = () => {};
+    context.fetch = async () => ({ ok: true, json: async () => ({ operation: {
+      id: 'import-1', status: 'succeeded', result: { ok: false, status: 'blocked', reasonCode },
+    } }) });
+    scout.watchJobImport('import-1');
+    await timer();
+    const html = sections['tab-jobs'].innerHTML;
+    if (reasonCode === 'source-unavailable') assert.match(html, /id="job-import-advert"/);
+    else assert.doesNotMatch(html, /id="job-import-advert"/);
+    assert.match(html, reasonCode === 'source-unavailable' ? /could not read the public listing/i : /could not verify one vacancy/i);
+  }
+});
+
+test('job import resolves entryId from the refreshed tracker and opens imported or duplicate records', async () => {
+  for (const status of ['imported', 'duplicate']) {
+    const { scout, context } = loadScout();
+    const { doc, sections } = withJobsDom();
+    const importUrl = { value: 'https://jobs.example/role' };
+    const pastedAdvert = { value: 'Advert draft' };
+    doc.getElementById = (id) => id === 'job-import-url' ? importUrl : id === 'job-import-advert' ? pastedAdvert : (sections[id] ||= { innerHTML: '', classList: { toggle() {} } });
+    context.document = doc;
+    const stored = new Map();
+    context.localStorage = { getItem: (key) => stored.get(key) || null, setItem: (key, value) => stored.set(key, value) };
+    let timer;
+    context.setTimeout = (fn) => { timer = fn; return 1; };
+    context.clearTimeout = () => {};
+    context.fetch = async () => ({ ok: true, json: async () => ({ operation: {
+      status: 'succeeded', result: { ok: true, status, entryId: 'saved-entry', warnings: ['Saved <b>warning</b>'] },
+    } }) });
+    const entry = { id: 'saved-entry', company: 'Example', role: 'Editor', status: 'new', notes: 'Saved assessment notes' };
+    scout.state.data = { opportunities: [entry] };
+    scout.loadOpportunities = async () => {};
+    const sequence = [];
+    const renderJobs = scout.renderJobs.bind(scout);
+    scout.renderJobs = () => { sequence.push('render'); renderJobs(); };
+    scout.openEntry = (tab, id) => { sequence.push('open'); scout.opened = [tab, id]; };
+    scout.filterBar = () => '';
+    scout.latestScanCard = () => '';
+    scout.jobImportDraft = importUrl.value;
+    scout.jobImportPastedAdvert = pastedAdvert.value;
+    scout.jobImportNeedsPaste = true;
+    scout.watchJobImport('operation-1');
+    await timer();
+    assert.deepEqual(scout.opened, ['jobs', 'saved-entry']);
+    assert.deepEqual(sequence.slice(-2), ['render', 'open']);
+    assert.equal(importUrl.value, '');
+    assert.equal(pastedAdvert.value, '');
+    assert.equal(scout.jobImportDraft, '');
+    assert.equal(scout.jobImportPastedAdvert, '');
+    assert.equal(JSON.parse(stored.get(scout.jobImportStorageKey)).url, '');
+    assert.equal(scout.jobImportOutcome.duplicate, status === 'duplicate');
+    assert.match(sections['tab-jobs'].innerHTML, /Saved &lt;b&gt;warning&lt;\/b&gt;/);
+    assert.match(scout.detailHtml(entry), /Saved assessment notes/);
+  }
+});
+
+test('URL credentials are rejected before they can be saved as an import draft', async () => {
+  const { scout, context } = loadScout();
+  const { doc, sections } = withJobsDom();
+  const input = { value: 'https://user:secret@jobs.example/role' };
+  doc.getElementById = (id) => id === 'job-import-url' ? input : (sections[id] ||= { innerHTML: '', classList: { toggle() {} } });
+  context.document = doc;
+  const stored = new Map();
+  context.localStorage = { getItem: (key) => stored.get(key) || null, setItem: (key, value) => stored.set(key, value) };
+  scout.state.data = { opportunities: [] };
+  scout.filterBar = () => '';
+  scout.latestScanCard = () => '';
+  let posts = 0;
+  context.fetch = async () => { posts += 1; throw new Error('must not post'); };
+  scout.jobImportDraft = input.value;
+  await scout.importJobFromUrl();
+  assert.equal(posts, 0);
+  assert.match(sections['tab-jobs'].innerHTML, /without a username or password/i);
+  assert.doesNotMatch(stored.get(scout.jobImportStorageKey), /secret|user/);
+});
+
+test('a failed import never offers pasted-ad fallback and uses its safe string error', async () => {
+  const { scout, context } = loadScout();
+  const { doc, sections } = withJobsDom();
+  context.document = doc;
+  let timer;
+  context.setTimeout = (fn) => { timer = fn; return 1; };
+  context.clearTimeout = () => {};
+  context.fetch = async () => ({ ok: true, json: async () => ({ operation: { status: 'failed', error: 'Workspace is busy.' } }) });
+  scout.state.data = { opportunities: [] };
+  scout.filterBar = () => '';
+  scout.latestScanCard = () => '';
+  scout.watchJobImport('operation-1');
+  await timer();
+  assert.match(sections['tab-jobs'].innerHTML, /Workspace is busy\./);
+  assert.doesNotMatch(sections['tab-jobs'].innerHTML, /job-import-advert/);
+});
+
+test('job import draft and pending operation survive reload, while repeated status network failures stop', async () => {
+  const saved = new Map();
+  const storage = { getItem: (key) => saved.get(key) || null, setItem: (key, value) => saved.set(key, value) };
+  const { scout, context } = loadScout();
+  context.localStorage = storage;
+  scout.jobImportDraft = 'https://jobs.example/role';
+  scout.jobImportPastedAdvert = 'Draft advert';
+  scout.jobImportOperationId = 'operation-1';
+  scout.saveJobImportState();
+  const reloaded = loadScout();
+  reloaded.context.localStorage = storage;
+  reloaded.scout.restoreJobImportState();
+  assert.equal(reloaded.scout.jobImportDraft, 'https://jobs.example/role');
+  assert.equal(reloaded.scout.jobImportPastedAdvert, 'Draft advert');
+  assert.equal(reloaded.scout.jobImportOperationId, 'operation-1');
+
+  const { doc, sections } = withJobsDom();
+  reloaded.context.document = doc;
+  let timer;
+  reloaded.context.setTimeout = (fn) => { timer = fn; return 1; };
+  reloaded.context.clearTimeout = () => {};
+  reloaded.context.fetch = async () => { throw new Error('offline'); };
+  reloaded.scout.state.data = { opportunities: [] };
+  reloaded.scout.filterBar = () => '';
+  reloaded.scout.latestScanCard = () => '';
+  reloaded.scout.watchJobImport('operation-1');
+  for (let i = 0; i < 5; i += 1) await timer();
+  assert.equal(reloaded.scout.jobImportBusy, false);
+  assert.match(sections['tab-jobs'].innerHTML, /Refresh this page to resume checking/);
+  assert.equal(reloaded.scout.jobImportOperationId, 'operation-1');
+});
+
 test('speculative classification uses the exact tag case-insensitively', () => {
   const { scout } = loadScout();
   assert.equal(scout.isSpeculative({ tags: ['Speculative Outreach'] }), true);

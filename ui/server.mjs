@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { isMainModule } from './lib/mainModule.mjs';
 import { atomicWriteFile } from './lib/atomicWrite.mjs';
 import { addSpeculativeProspect } from './lib/speculativeProspects.mjs';
+import { registerJobImportRoutes } from './lib/jobImportService.mjs';
 import { loadCachedAdvertObservations, restoreAdvertFacts } from './lib/restoreAdvertFacts.mjs';
 import {
   PROFILE_PUBLICATION_RUN_PREFIX, publishProfileGeneration,
@@ -2826,6 +2827,7 @@ routes['POST /api/shutdown'] = (req, res) => {
   }, 200);
 };
 
+registerJobImportRoutes({ routes, operations, repoRoot: WORKSPACE_ROOT, onCheckpoint: scheduleCheckpoint });
 registerCompanyRoutes({ routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint: scheduleCheckpoint });
 const chatRuntime = registerChatRoutes({
   routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint: scheduleCheckpoint,

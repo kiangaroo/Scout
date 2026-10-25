@@ -236,6 +236,52 @@ const Scout = {
   discoveryTimer: null,
   scanRunning: false,
   scanOperationTimer: null,
+  jobImportTimer: null,
+  jobImportBusy: false,
+  jobImportDraft: '',
+  jobImportPastedAdvert: '',
+  jobImportNeedsPaste: false,
+  jobImportMessage: '',
+  jobImportOutcome: null,
+  jobImportOperationId: null,
+  jobImportStorageKey: 'scout.job-import.v1',
+
+  restoreJobImportState() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(this.jobImportStorageKey) || '{}');
+      this.jobImportDraft = typeof saved.url === 'string' ? saved.url : '';
+      this.jobImportPastedAdvert = typeof saved.pastedAdvert === 'string' ? saved.pastedAdvert : '';
+      this.jobImportOperationId = typeof saved.operationId === 'string' ? saved.operationId : null;
+      this.jobImportBusy = Boolean(this.jobImportOperationId);
+      this.jobImportNeedsPaste = Boolean(saved.needsPaste);
+      this.jobImportMessage = this.jobImportBusy ? 'Resuming import status check…' : '';
+    } catch {
+      this.jobImportDraft = '';
+      this.jobImportPastedAdvert = '';
+      this.jobImportOperationId = null;
+    }
+  },
+
+  saveJobImportState() {
+    try {
+      let storedUrl = '';
+      try {
+        const parsed = new URL(this.jobImportDraft);
+        if (['http:', 'https:'].includes(parsed.protocol) && !parsed.username && !parsed.password) storedUrl = this.jobImportDraft;
+      } catch { /* Do not persist malformed or credential-bearing URL drafts. */ }
+      localStorage.setItem(this.jobImportStorageKey, JSON.stringify({
+        url: storedUrl,
+        pastedAdvert: this.jobImportPastedAdvert,
+        operationId: this.jobImportOperationId,
+        needsPaste: this.jobImportNeedsPaste,
+      }));
+    } catch { /* Storage can be unavailable in private browsing. */ }
+  },
+
+  clearJobImportOperation() {
+    this.jobImportOperationId = null;
+    this.saveJobImportState();
+  },
   latestScan: null,
   feedbackLearning: null,
   lastSyncPullAt: null,
@@ -917,6 +963,11 @@ const Scout = {
 
   renderJobs() {
     if (!this.state.data) return;
+    const importInput = document.getElementById('job-import-url');
+    const advertInput = document.getElementById('job-import-advert');
+    if (importInput) this.jobImportDraft = importInput.value;
+    if (advertInput) this.jobImportPastedAdvert = advertInput.value;
+    this.saveJobImportState();
     const target = document.getElementById('tab-jobs');
     if (!target) return;
     const entries = this.filteredEntries('all')
@@ -926,9 +977,159 @@ const Scout = {
       ? entries.map((e) => this.triageCardHtml(e)).join('')
       : (this.latestScanCard() || '<p class="inbox-empty">All caught up - nothing new to review.</p>');
     target.innerHTML = this.filterBar()
+      + this.jobImportFormHtml()
       + `<div class="label">${entries.length} new job${entries.length === 1 ? '' : 's'} to review</div>`
       + list;
     this.updateJobsBadge(entries.length);
+  },
+
+  jobImportFormHtml() {
+    const outcome = this.jobImportOutcome;
+    const entry = outcome?.entry;
+    const link = entry?.id
+      ? `<button class="act" data-action="open-entry" data-tab="${this.esc(this.tabForEntry(entry))}" data-id="${this.esc(entry.id)}">${outcome.duplicate ? 'View existing job' : 'Open imported job'}</button>`
+      : '';
+    const warning = (outcome?.warnings || []).length
+      ? `<p class="meta">${(outcome.warnings || []).map((warningText) => this.esc(warningText)).join(' ')}</p>` : '';
+    return `<form id="job-import-form" class="job-import-form" data-submit-action="job-import" aria-label="Add job from URL">
+      <label for="job-import-url">Add job from URL</label>
+      <div class="controls"><input id="job-import-url" name="url" type="url" inputmode="url" autocomplete="url" maxlength="2048" placeholder="https://employer.example/jobs/role" required value="${this.esc(this.jobImportDraft)}" ${this.jobImportBusy ? 'disabled' : ''}>
+        <button class="act primary" type="submit" ${this.jobImportBusy ? 'disabled' : ''}>${this.jobImportBusy ? 'Importing…' : 'Import and score'}</button></div>
+      <p class="meta">Paste one public listing URL. Scout uses your configured AI provider and its existing allowance. The imported job keeps the usual research and CV tools.</p>
+      ${this.jobImportNeedsPaste ? `<label for="job-import-advert">Paste the advert text to continue</label><textarea id="job-import-advert" name="pastedAdvert" maxlength="100000" rows="5" ${this.jobImportBusy ? 'disabled' : ''}>${this.esc(this.jobImportPastedAdvert)}</textarea><button class="act" type="submit" ${this.jobImportBusy ? 'disabled' : ''}>Retry with pasted advert</button>` : ''}
+      <div id="job-import-status" class="meta" role="status" aria-live="polite">${this.esc(this.jobImportMessage)}${outcome ? ` ${outcome.duplicate ? 'This listing was already tracked; its saved record was left unchanged.' : 'Job imported and scored.'}` : ''}</div>
+      ${warning}${link}
+    </form>`;
+  },
+
+  async importJobFromUrl() {
+    if (this.jobImportBusy) return;
+    const urlInput = document.getElementById('job-import-url');
+    const advertInput = document.getElementById('job-import-advert');
+    const url = String(urlInput?.value || this.jobImportDraft || '').trim();
+    const pastedAdvert = String(advertInput?.value || this.jobImportPastedAdvert || '').trim();
+    this.jobImportDraft = url;
+    this.jobImportPastedAdvert = pastedAdvert;
+    this.jobImportOutcome = null;
+    this.jobImportNeedsPaste = false;
+    this.jobImportMessage = '';
+    try {
+      const parsed = new URL(url);
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error('Use a public HTTP or HTTPS listing URL without a username or password.');
+    } catch (error) {
+      this.jobImportMessage = error.message.startsWith('Use a public HTTP') ? error.message : 'Enter a valid public listing URL.';
+      this.renderJobs();
+      return;
+    }
+    this.saveJobImportState();
+    this.jobImportBusy = true;
+    this.jobImportMessage = 'Starting import…';
+    this.renderJobs();
+    try {
+      const response = await fetch('/api/jobs/import', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ url, ...(pastedAdvert ? { pastedAdvert } : {}) }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        this.jobImportBusy = false;
+        this.jobImportMessage = body.error || 'The job import could not start.';
+        this.jobImportNeedsPaste = body.reasonCode === 'source-unavailable';
+        this.saveJobImportState();
+        this.renderJobs();
+        return;
+      }
+      if (!body.operation?.id) throw new Error('Scout did not return an import operation.');
+      this.jobImportOperationId = body.operation.id;
+      this.saveJobImportState();
+      this.jobImportMessage = 'Importing the listing and scoring it…';
+      this.renderJobs();
+      this.watchJobImport(body.operation.id);
+    } catch (error) {
+      this.jobImportBusy = false;
+      this.jobImportMessage = error.message || 'The job import could not start.';
+      this.clearJobImportOperation();
+      this.renderJobs();
+    }
+  },
+
+  watchJobImport(id) {
+    if (this.jobImportTimer) clearTimeout(this.jobImportTimer);
+    this.jobImportOperationId = id;
+    this.jobImportBusy = true;
+    this.saveJobImportState();
+    let consecutiveErrors = 0;
+    const poll = async () => {
+      try {
+        const response = await fetch(`/api/operations/${encodeURIComponent(id)}`);
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || !body.operation) throw new Error(body.error || 'Import status is unavailable.');
+        consecutiveErrors = 0;
+        const operation = body.operation;
+        if (['queued', 'running'].includes(operation.status)) {
+          this.jobImportMessage = operation.phase || 'Importing the listing and scoring it…';
+          this.renderJobs();
+          this.jobImportTimer = setTimeout(poll, 1000);
+          return;
+        }
+        this.jobImportTimer = null;
+        this.jobImportBusy = false;
+        this.clearJobImportOperation();
+        let entryToOpen = null;
+        if (operation.status === 'succeeded' && ['imported', 'duplicate'].includes(operation.result?.status)) {
+          const entryId = operation.result.entryId;
+          this.jobImportDraft = '';
+          this.jobImportPastedAdvert = '';
+          this.jobImportNeedsPaste = false;
+          const urlInput = document.getElementById('job-import-url');
+          const advertInput = document.getElementById('job-import-advert');
+          if (urlInput) urlInput.value = '';
+          if (advertInput) advertInput.value = '';
+          this.saveJobImportState();
+          let refreshed = true;
+          try { await this.loadOpportunities(); } catch { refreshed = false; }
+          const entry = this.state.data?.opportunities?.find((item) => item.id === entryId) || null;
+          this.jobImportDraft = '';
+          this.jobImportPastedAdvert = '';
+          this.jobImportNeedsPaste = false;
+          this.saveJobImportState();
+          this.jobImportOutcome = {
+            entry, duplicate: operation.result.status === 'duplicate',
+            warnings: Array.isArray(operation.result.warnings) ? operation.result.warnings : [],
+          };
+          this.jobImportMessage = refreshed && entry
+            ? ''
+            : 'Import completed, but Scout could not load the saved job. Refresh to view it.';
+          if (entry?.id) entryToOpen = entry;
+        } else if (operation.status === 'succeeded' && operation.result?.ok === false && operation.result?.status === 'blocked') {
+          this.jobImportMessage = operation.result.reasonCode === 'source-unavailable'
+            ? 'Scout could not read the public listing. Paste the advert text to continue.'
+            : `Scout could not verify one vacancy (${this.esc(operation.result.reasonCode || 'blocked')}).`;
+          this.jobImportNeedsPaste = operation.result.reasonCode === 'source-unavailable';
+          this.saveJobImportState();
+        } else {
+          this.jobImportMessage = typeof operation.error === 'string' ? operation.error : 'The listing could not be imported.';
+          this.jobImportNeedsPaste = false;
+          this.saveJobImportState();
+        }
+        this.renderJobs();
+        if (entryToOpen?.id) this.openEntry(this.tabForEntry(entryToOpen), entryToOpen.id);
+      } catch {
+        consecutiveErrors += 1;
+        if (consecutiveErrors >= 5) {
+          this.jobImportTimer = null;
+          this.jobImportBusy = false;
+          this.jobImportMessage = 'Could not check import status after several attempts. Refresh this page to resume checking.';
+          this.saveJobImportState();
+          this.renderJobs();
+          return;
+        }
+        this.jobImportMessage = 'Checking import status…';
+        this.renderJobs();
+        this.jobImportTimer = setTimeout(poll, 1000);
+      }
+    };
+    this.jobImportTimer = setTimeout(poll, 250);
   },
 
   renderSpeculative() {
@@ -3198,14 +3399,29 @@ const Scout = {
       else if (element.dataset.engineModel) this.onEngineModelChange(element);
     });
     document.addEventListener?.('input', (event) => {
-      if (event.target.dataset.inputAction !== 'cv-dirty') return;
+      if (event.target.id === 'job-import-url') {
+        this.jobImportDraft = event.target.value;
+        this.saveJobImportState();
+        return;
+      }
+      if (event.target.id === 'job-import-advert') {
+        this.jobImportPastedAdvert = event.target.value;
+        this.saveJobImportState();
+        return;
+      }
+      if (event.target.dataset?.inputAction !== 'cv-dirty') return;
       this.cvState.dirty = true;
       this.cvState.content = event.target.value;
       const dirty = document.getElementById('cv-dirty');
       if (dirty) dirty.textContent = 'unsaved';
     });
     document.addEventListener?.('submit', (event) => {
-      if (event.target.dataset.submitAction !== 'save-company-communication') return;
+      const submitAction = event.target.dataset?.submitAction;
+      if (submitAction === 'job-import') {
+        event.preventDefault();
+        return this.importJobFromUrl();
+      }
+      if (submitAction !== 'save-company-communication') return;
       event.preventDefault();
       this.saveCompanyCommunication();
     });
@@ -3309,6 +3525,7 @@ const Scout = {
       initialFocus: '#scan-result-title', onEscape: () => this.closeScanResult(),
     });
     this.registerServiceWorker();
+    this.restoreJobImportState();
     window.addEventListener?.('offline', () => this.setHostAvailable(false));
     window.addEventListener?.('online', () => this.loadOpportunities().catch(() => this.setHostAvailable(false)));
     document.querySelectorAll('nav button').forEach((b) =>
@@ -3334,6 +3551,7 @@ const Scout = {
       }
     });
     this.loadOpportunities();
+    if (this.jobImportOperationId) this.watchJobImport(this.jobImportOperationId);
     this.reattachScanOperation();
     this.refreshSyncStatus();
     this.checkUiBuild();
