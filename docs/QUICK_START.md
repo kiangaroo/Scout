@@ -151,6 +151,8 @@ For older saved jobs, select **Restore facts from saved scans**. This repairs ma
 
 ### Research an application approach
 
+If Scout is briefly finishing startup or backup work, research waits before starting the AI turn. If the workspace stays busy, retry after the update or scan completes. Closing or stopping a waiting request cancels it. A retry does not repeat an AI turn that has already started.
+
 1. Expand a job and select **research my application approach**. This opens the existing job chat with a prepared request; opening it does not call a model.
 2. Choose an available provider/model and send when ready. Research uses your existing provider allowance. No additional research account or API key is required.
 3. Review the recommended route and up to two worthwhile alternatives: evidence links and dates, confirmed facts versus inference, employer restrictions, material to reuse, estimated preparation time and unresolved questions. A normal application may be the best route. Ideas default to 30 minutes or less of your preparation time; AI runtime is not promised.

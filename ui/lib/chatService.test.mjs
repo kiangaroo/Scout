@@ -61,7 +61,7 @@ function tmpRoot() {
 
 function routeFixture(root, overrides = {}) {
   const routes = {};
-  registerChatRoutes({
+  routes.lifecycle = registerChatRoutes({
     routes,
     repoRoot: root,
     readTracker: () => ({ opportunities: [ENTRY] }),
@@ -273,6 +273,76 @@ test('application approach uses pinned prompt and persists final plan under auth
   assert.equal(JSON.parse(get.text()).applicationApproach.content, '# Approach\nTargeted plan.');
 });
 
+test('application approach prompt carries bounded selected evidence without dumping the tracker', async () => {
+  const root = tmpRoot();
+  fs.mkdirSync(path.join(root, 'profile'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'cv'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'profile', 'context.md'), 'PROFILE_CONTEXT_FIXTURE');
+  fs.writeFileSync(path.join(root, 'profile', 'calibration.md'), 'CALIBRATION_FIXTURE');
+  fs.writeFileSync(path.join(root, 'cv', 'master-cv.md'), 'MASTER_CV_FIXTURE');
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), JSON.stringify({
+    opportunities: [ENTRY, { id: 'second-role-2026-08', company: 'Private Decoy', role: 'Other', notes: 'TRACKER_DUMP_MUST_NOT_APPEAR' }],
+  }));
+  let captured;
+  const routes = routeFixture(root, {
+    readTracker: () => ({ opportunities: [ENTRY, { id: 'second-role-2026-08', company: 'Private Decoy', role: 'Other', notes: 'TRACKER_DUMP_MUST_NOT_APPEAR' }] }),
+    runTurnFn: (options) => {
+      captured = options;
+      return { stop() {}, finished: Promise.resolve({ ok: true, text: '# Plan', filesTouched: [] }) };
+    },
+  });
+  await callRoute(routes['POST /api/chat/send'], JSON.stringify({
+    id: ID, engine: 'codex', mode: 'application-approach', text: 'Prepare a plan',
+  }));
+  assert.match(captured.prompt, /PROFILE_CONTEXT_FIXTURE/);
+  assert.match(captured.prompt, /CALIBRATION_FIXTURE/);
+  assert.match(captured.prompt, /MASTER_CV_FIXTURE/);
+  assert.match(captured.prompt, /Selected opportunity \(authoritative/);
+  assert.match(captured.prompt, /Tracker evidence is limited to the selected opportunity/);
+  assert.doesNotMatch(captured.prompt, /TRACKER_DUMP_MUST_NOT_APPEAR|Private Decoy/);
+});
+
+test('application approach research context rejects symlinked evidence files', async () => {
+  const root = tmpRoot();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-research-outside-'));
+  try {
+    fs.writeFileSync(path.join(outside, 'context.md'), 'OUTSIDE_SECRET_MUST_NOT_ENTER_PROMPT');
+    fs.symlinkSync(outside, path.join(root, 'profile'), 'junction');
+    let captured;
+    const routes = routeFixture(root, {
+      runTurnFn: (options) => {
+        captured = options;
+        return { stop() {}, finished: Promise.resolve({ ok: true, text: '# Plan', filesTouched: [] }) };
+      },
+    });
+    await callRoute(routes['POST /api/chat/send'], JSON.stringify({
+      id: ID, engine: 'codex', mode: 'application-approach', text: 'Prepare a plan',
+    }));
+    assert.match(captured.prompt, /profile\/context\.md:\n\[unavailable; evidence not provided\]/);
+    assert.doesNotMatch(captured.prompt, /OUTSIDE_SECRET_MUST_NOT_ENTER_PROMPT/);
+  } finally { fs.rmSync(outside, { recursive: true, force: true }); }
+});
+
+test('application approach bounds oversized selected opportunity context explicitly', async () => {
+  const root = tmpRoot();
+  const largeEntry = { ...ENTRY, contacts: [{ name: 'OVERSIZED_CONTACT_FIXTURE'.repeat(2_000) }] };
+  let captured;
+  const routes = routeFixture(root, {
+    readTracker: () => ({ opportunities: [largeEntry] }),
+    runTurnFn: (options) => {
+      captured = options;
+      return { stop() {}, finished: Promise.resolve({ ok: true, text: '# Plan', filesTouched: [] }) };
+    },
+  });
+  await callRoute(routes['POST /api/chat/send'], JSON.stringify({
+    id: ID, engine: 'codex', mode: 'application-approach', text: 'Prepare a plan',
+  }));
+  const selected = captured.prompt.split('\n\nBounded authoritative research context')[0];
+  assert.ok(selected.length < 16_200);
+  assert.match(selected, /Selected opportunity context truncated at 16000 characters; omitted fields are unknown/);
+});
+
 test('application approach mode rejects non-job purposes without starting a provider', async () => {
   const root = tmpRoot();
   let calls = 0;
@@ -295,6 +365,132 @@ test('application approach provider failure leaves an existing saved plan intact
   }));
   assert.equal(sseEvents(response.text()).at(-1).event, 'error');
   assert.equal(readApplicationApproach(root, ENTRY).content, '# Existing');
+});
+
+function mutationBusy() {
+  const error = new Error('workspace mutation busy');
+  error.reasonCode = 'mutation-busy';
+  return error;
+}
+
+test('application approach retries transient workspace busy before spawning exactly one provider turn', async () => {
+  const root = tmpRoot();
+  let authorityAttempts = 0;
+  let providerStarts = 0;
+  const delays = [];
+  const routes = routeFixture(root, {
+    delayFn: async (ms) => { delays.push(ms); },
+    withWorkspaceMutationAuthorityAsyncFn: async (_root, _meta, callback) => {
+      authorityAttempts += 1;
+      if (authorityAttempts === 1) throw mutationBusy();
+      return callback({ coordinator: { beginChild: () => null, finishChild() {} } });
+    },
+    runTurnFn: () => {
+      providerStarts += 1;
+      return { stop() {}, finished: Promise.resolve({ ok: true, text: '# Saved plan', filesTouched: [] }) };
+    },
+  });
+  const response = await callRoute(routes['POST /api/chat/send'], JSON.stringify({
+    id: ID, engine: 'codex', mode: 'application-approach', text: 'Prepare a plan',
+  }));
+  assert.equal(sseEvents(response.text()).at(-1).event, 'done');
+  assert.equal(authorityAttempts, 2);
+  assert.equal(providerStarts, 1);
+  assert.deepEqual(delays, [500]);
+});
+
+test('application approach gives bounded busy error without starting the provider', async () => {
+  const root = tmpRoot();
+  let authorityAttempts = 0;
+  let providerStarts = 0;
+  const delays = [];
+  const routes = routeFixture(root, {
+    delayFn: async (ms) => { delays.push(ms); },
+    withWorkspaceMutationAuthorityAsyncFn: async () => { authorityAttempts += 1; throw mutationBusy(); },
+    runTurnFn: () => { providerStarts += 1; throw new Error('must not start'); },
+  });
+  const response = await callRoute(routes['POST /api/chat/send'], JSON.stringify({
+    id: ID, engine: 'codex', mode: 'application-approach', text: 'Prepare a plan',
+  }));
+  const finalEvent = sseEvents(response.text()).at(-1);
+  assert.equal(finalEvent.event, 'error');
+  assert.equal(finalEvent.data.reasonCode, 'workspace-busy');
+  assert.match(finalEvent.data.message, /no AI turn was started/);
+  assert.equal(authorityAttempts, 4);
+  assert.equal(providerStarts, 0);
+  assert.deepEqual(delays, [500, 1000, 2000]);
+});
+
+test('stopping or disconnecting during an application approach wait prevents provider start', async () => {
+  for (const action of ['stop', 'disconnect']) {
+    const root = tmpRoot();
+    let delayStarted;
+    const waiting = new Promise((resolve) => { delayStarted = resolve; });
+    let providerStarts = 0;
+    const routes = routeFixture(root, {
+      delayFn: () => { delayStarted(); return new Promise(() => {}); },
+      withWorkspaceMutationAuthorityAsyncFn: async () => { throw mutationBusy(); },
+      runTurnFn: () => { providerStarts += 1; throw new Error('must not start'); },
+    });
+    const req = new EventEmitter();
+    const res = new MockResponse();
+    routes['POST /api/chat/send'](req, res, JSON.stringify({
+      id: ID, engine: 'codex', mode: 'application-approach', text: 'Prepare a plan',
+    }));
+    await waiting;
+    if (action === 'stop') {
+      await callRoute(routes['POST /api/chat/stop'], JSON.stringify({ id: ID }));
+    } else {
+      req.emit('aborted');
+    }
+    await res.finished;
+    const finalEvent = sseEvents(res.text()).at(-1);
+    assert.equal(finalEvent.event, 'error');
+    assert.equal(finalEvent.data.reasonCode, 'cancelled-before-start');
+    assert.equal(providerStarts, 0);
+  }
+});
+
+test('shutdown cancels and drains a waiting application approach before provider start', async () => {
+  const root = tmpRoot();
+  let delayStarted;
+  const waiting = new Promise((resolve) => { delayStarted = resolve; });
+  let providerStarts = 0;
+  const routes = routeFixture(root, {
+    delayFn: () => { delayStarted(); return new Promise(() => {}); },
+    withWorkspaceMutationAuthorityAsyncFn: async () => { throw mutationBusy(); },
+    runTurnFn: () => { providerStarts += 1; throw new Error('must not start'); },
+  });
+  const req = new EventEmitter();
+  const res = new MockResponse();
+  routes['POST /api/chat/send'](req, res, JSON.stringify({
+    id: ID, engine: 'codex', mode: 'application-approach', text: 'Prepare a plan',
+  }));
+  await waiting;
+  await routes.lifecycle.shutdown({ timeoutMs: 500 });
+  await res.finished;
+  const finalEvent = sseEvents(res.text()).at(-1);
+  assert.equal(finalEvent.event, 'error');
+  assert.equal(finalEvent.data.reasonCode, 'shutdown-before-start');
+  assert.equal(providerStarts, 0);
+});
+
+test('a busy error after the provider starts does not retry the AI turn', async () => {
+  const root = tmpRoot();
+  let providerStarts = 0;
+  const routes = routeFixture(root, {
+    delayFn: async () => assert.fail('must not wait or retry after spawn'),
+    runTurnFn: () => {
+      providerStarts += 1;
+      const error = mutationBusy();
+      return { stop() {}, finished: Promise.reject(error) };
+    },
+  });
+  const response = await callRoute(routes['POST /api/chat/send'], JSON.stringify({
+    id: ID, engine: 'codex', mode: 'application-approach', text: 'Prepare a plan',
+  }));
+  assert.equal(sseEvents(response.text()).at(-1).event, 'error');
+  assert.equal(providerStarts, 1);
 });
 
 test('application approach turns enable Codex web search on fresh and resumed sessions only', async () => {

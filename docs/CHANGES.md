@@ -2,6 +2,8 @@
 
 ## Fixed
 
+- Research waits briefly for startup or backup workspace updates before starting one AI turn. Persistent contention is reported as workspace busy. Research receives bounded selected-job and career evidence instead of rereading the full tracker; output limits remain unchanged.
+
 - Add **research my application approach** to job details: a user-started research turn in the existing job chat, with a saved per-opportunity plan, evidence and effort guidance, and separate drafting choices. Research uses read-only provider controls; failed or empty results preserve the previous plan.
 
 - Job source previews try up to three saved alternatives after a fetch failure, label fallback use, and allow retrying a failed preview. Job details provide a user-triggered employer/title web search without treating results as verified vacancies.
