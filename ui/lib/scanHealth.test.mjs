@@ -7,6 +7,8 @@ import {
   normaliseSourceHealth, parseScanRuns, publicQueueSummary, publicRunSummary,
   publicStoragePressure, readPublicRunSummaries, readPublicStoragePressure, scanHealthFromText,
 } from './scanHealth.mjs';
+import { acquireScanLease, currentLeaseOwner, releaseScanLease } from './scanLease.mjs';
+import { appendRunEvent, openRunJournal } from './runJournal.mjs';
 
 test('parseScanRuns parses jsonl and reports bad lines', () => {
   const out = parseScanRuns('{"timestamp":"2026-07-08T07:30:00"}\nnope\n');
@@ -358,9 +360,19 @@ test('public run and queue summaries use closed privacy-safe projections', () =>
   assert.deepEqual(queue.requests[0], {
     id: 'request-…', status: 'claimed', requester: 'manual', purpose: 'job-discovery',
     requestedAt: '2026-07-29T00:00:00.000Z', expiresAt: '2026-07-30T00:00:00.000Z',
-    runId: 'run-1234…', owner: 'active worker',
+    runId: 'run-1234…',
   });
   assert.doesNotMatch(JSON.stringify(queue), /PRIVATE-HOST|4242|private-start|private-lease|secret-token|private prompt|a{32}|b{32}/i);
+});
+
+test('queue claims never imply a live active worker for terminal or claimed requests', () => {
+  const queue = publicQueueSummary({ requests: ['claimed', 'completed', 'failed'].map((status) => ({
+    id: `request-${status}`, status, claim: {
+      runId: 'private-run-id', owner: { host: 'PRIVATE-HOST', pid: 4242, processStart: 'private-start' },
+    },
+  })) });
+  assert.deepEqual(queue.requests.map((request) => request.status), ['claimed', 'completed', 'failed']);
+  assert.ok(queue.requests.every((request) => !Object.hasOwn(request, 'owner')));
 });
 
 test('a corrupt run directory never publishes its unvalidated name', () => {
@@ -372,6 +384,49 @@ test('a corrupt run directory never publishes its unvalidated name', () => {
     const result = readPublicRunSummaries(root);
     assert.equal(result.runs[0].id, 'invalid-run');
     assert.doesNotMatch(JSON.stringify(result), /private-looking-prefix-secret|private-looking/i);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('public run summaries omit profile-publication mutation journals but retain real scans', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-public-run-kinds-'));
+  const append = (runId, kind) => {
+    const lease = acquireScanLease(root, currentLeaseOwner(), kind === 'scan'
+      ? { kind: 'scan', runId, provider: 'codex', model: 'provider-default', mode: 'primary', phase: 'collection' }
+      : { kind: 'search-plan-mutation', runId, phase: 'publish' });
+    assert.ok(lease);
+    try {
+      const run = openRunJournal(root, runId);
+      if (kind === 'scan') {
+        appendRunEvent(run, {
+          type: 'run.started', stageId: 'initialise', idempotencyKey: 'run-started-v1',
+          payload: { schemaVersion: 1, compatibility: {
+            schemaVersion: 1, journalSchemaVersion: 1, artifactSchemaVersion: 1,
+            mode: 'primary', purpose: 'job-discovery', profileVersion: 'profile-v1',
+            sourceConfigFingerprint: 'a'.repeat(64), pipelineVersion: 'pipeline-v1',
+            rankingVersion: 'ranking-v1', promptVersion: 'prompt-v1',
+            assessmentSchemaVersion: 1, provider: 'codex', model: 'provider-default',
+            mutationSchemaVersion: 1, targetRevision: 'tracker-v1',
+          } },
+        }, lease);
+      } else {
+        appendRunEvent(run, {
+          type: 'mutation.prepared', stageId: 'publish', idempotencyKey: 'mutation-prepared-v1',
+          payload: { schemaVersion: 1, reference: { kind: 'mutation', id: 'publication-1' },
+            digest: 'b'.repeat(64), targetRevision: 'c'.repeat(64) },
+        }, lease);
+      }
+    } finally {
+      releaseScanLease(lease);
+    }
+  };
+  try {
+    append('search-plan-publish-synthetic', 'publication');
+    append('genuine-scan-synthetic', 'scan');
+    const result = readPublicRunSummaries(root);
+    assert.deepEqual(result.runs.map((run) => run.id), ['genuine-…']);
+    assert.equal(result.runs[0].state, 'collecting');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

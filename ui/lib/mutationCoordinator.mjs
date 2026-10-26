@@ -305,6 +305,33 @@ export function loadPreparedMutation(handle, mutationId) {
   return readJournalledPreparedArtifact(handle, mutationId).plan;
 }
 
+export function loadRecoverablePreparedFinalisation(handle) {
+  if (!handle?.events || !handle?.file) throw new TypeError('run journal handle is required');
+  const events = replayRunJournal(handle.file);
+  const failed = [...events].reverse().find((event) => event.type === 'run.completed');
+  if (failed?.payload?.outcome !== 'failed') return null;
+  const prepared = [...events].reverse().find((event) => (
+    event.type === 'mutation.prepared'
+    && event.stageId === 'finalise'
+    && event.payload?.reference?.kind === 'mutation'
+  ));
+  if (!prepared || prepared.sequence >= failed.sequence) return null;
+  const mutationId = prepared.payload.reference.id;
+  if (events.some((event) => (
+    event.type === 'mutation.receipted'
+    && event.payload?.reference?.kind === 'mutation'
+    && event.payload.reference.id === mutationId
+  ))) return null;
+  try {
+    const plan = loadPreparedMutation(handle, mutationId);
+    return ['prepared', 'applied-unreceipted'].includes(reconcileMutation(plan).status)
+      ? plan
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function validateTarget(target) {
   if (!target || Object.getPrototypeOf(target) !== Object.prototype
     || !Array.isArray(target.files) || !target.files.length
@@ -527,7 +554,13 @@ function readGuard(directory) {
 function existingGuardMayStillMutate(existing) {
   if (processOwnerIsLiveOrAmbiguous(existing.owner)) return true;
   if (existing.childOperation === null) return false;
-  if (existing.childOperation.state === 'starting' || existing.childOperation.owner === null) return true;
+  if (existing.childOperation.state === 'starting') {
+    // `git ls-files` only reads the index. If its owner died before recording
+    // the child PID, reclaiming this older fenced guard cannot overlap a
+    // workspace write. Other launch phases remain ambiguous and fail closed.
+    return existing.childOperation.phase !== 'ls-files';
+  }
+  if (existing.childOperation.owner === null) return true;
   return processOwnerIsLiveOrAmbiguous(existing.childOperation.owner);
 }
 

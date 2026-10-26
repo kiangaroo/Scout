@@ -30,6 +30,94 @@ function loadScout() {
   return { scout: context.window.Scout, context };
 }
 
+test('application approach opens the existing job chat with a research draft but no automatic send', async () => {
+  const { scout, context } = loadScout();
+  const input = { value: '' };
+  context.document = { getElementById: () => input, querySelectorAll: () => [] };
+  const calls = [];
+  scout.api = async (url) => { calls.push(url); return { purpose: 'job', chat: null, prefills: { applicationApproach: 'Research the selected role' }, applicationApproach: { exists: false } }; };
+  scout.renderChatDrawer = () => {};
+  scout.closeCompanyHistory = () => {};
+  scout.loadEngineOptions = () => {};
+  scout.refreshUsage = () => {};
+  scout.refreshCodexDeepLink = () => {};
+  scout.sendChat = () => { throw Error('Opening must not spend a provider turn'); };
+  await scout.openChat('example-role', 'applicationApproach');
+  assert.equal(scout.chat.purpose, 'job');
+  assert.equal(scout.chat.mode, 'application-approach');
+  assert.equal(input.value, 'Research the selected role');
+  assert.deepEqual(calls, ['/api/chat?id=example-role']);
+  const html = scout.detailHtml({ id: 'example-role', company: 'Example', role: 'Editor', sources: [], status: 'new' });
+  assert.match(html, /data-prefill="applicationApproach"/);
+  assert.match(html, /research my application approach/i);
+});
+
+test('saved application plans are escaped and idea drafting is an explicit separate choice', () => {
+  const { scout, context } = loadScout();
+  const input = { value: '', focus() {} };
+  context.document = { getElementById: () => input };
+  scout.chat = { purpose: 'job', mode: null, streaming: false, applicationApproach: { exists: true, content: '<script>bad()</script>', updatedAt: null }, prefills: { applicationApproach: 'Research again', approachDraft: 'Ask which idea I choose' } };
+  const html = scout.applicationApproachHtml();
+  assert.match(html, /View application plan/);
+  assert.match(html, /&lt;script&gt;/);
+  assert.doesNotMatch(html, /<script>/);
+  scout.useApproachPrompt('approachDraft');
+  assert.equal(scout.chat.mode, null);
+  assert.equal(input.value, 'Ask which idea I choose');
+  scout.useApproachPrompt('applicationApproach');
+  assert.equal(scout.chat.mode, 'application-approach');
+  assert.equal(input.value, 'Research again');
+  scout.chat.purpose = 'interview-prep';
+  assert.equal(scout.applicationApproachHtml(), '');
+});
+
+test('application plan source links are clickable public HTTP URLs without embedded credentials', () => {
+  const { scout } = loadScout();
+  const html = scout.approachSourceLinksHtml('[Official role](https://example.test/job?id=4&lang=en) https://example.test/job?id=4&lang=en https://user:secret@unsafe.test/job javascript:alert(1)');
+  assert.match(html, /href="https:\/\/example.test\/job\?id=4&amp;lang=en"/);
+  assert.equal((html.match(/<a /g) || []).length, 1);
+  assert.doesNotMatch(html, /secret|javascript:/);
+});
+
+test('source recovery searches only the public employer and role and explains uncertainty', () => {
+  const { scout } = loadScout();
+  const entry = { company: 'Example & Co', role: 'Editor "Food"', notes: 'PRIVATE-NOTES', contacts: [{ email: 'PRIVATE-EMAIL' }], sources: ['javascript:alert(1)', 'https://example.test/jobs/17'] };
+  assert.equal(scout.primarySource(entry), 'https://example.test/jobs/17');
+  const html = scout.sourceRecoveryHtml(entry);
+  assert.match(html, /Search for this job/);
+  assert.match(html, /google\.com\/search/);
+  assert.match(html, /not verified/i);
+  assert.doesNotMatch(html, /PRIVATE|javascript:/);
+  const match = html.match(/href="([^"]*google[^\"]*)"/);
+  const url = new URL(match[1].replaceAll('&amp;', '&'));
+  assert.equal(url.searchParams.get('q'), '"Example & Co" "Editor Food"');
+  assert.equal(scout.sourceRecoveryHtml({ company: '', role: '' }), '');
+});
+
+test('source fetch failure offers the job search rather than only the failing link', () => {
+  const { scout } = loadScout();
+  const entry = { company: 'Example', role: 'Editor', sources: ['https://example.test/job'] };
+  const html = scout.sourceBodyHtml({ ok: false, error: 'source returned 403' }, entry);
+  assert.match(html, /403/);
+  assert.match(html, /Search for this job/);
+  assert.match(html, /does not prove.*closed/i);
+  const fallback = scout.sourceBodyHtml({ ok: true, url: 'https://other.test/job', fetchedAt: '2026-10-24T12:00:00Z', facts: {}, text: 'Job text', thin: false, fallbackUsed: true }, entry);
+  assert.match(fallback, /saved alternative/i);
+});
+
+test('a failed source preview can be retried by reopening it', async () => {
+  const { scout } = loadScout();
+  let calls = 0;
+  const body = { style: { display: 'none' }, dataset: {}, innerHTML: '' };
+  const button = { closest: () => ({ querySelector: () => body }), textContent: '' };
+  scout.state.data = { opportunities: [{ id: 'example', company: 'Example', role: 'Editor' }] };
+  scout.api = async () => { calls++; return { ok: false, error: 'source returned 403' }; };
+  await scout.toggleSourcePanel('example', button);
+  await scout.toggleSourcePanel('example', button);
+  await scout.toggleSourcePanel('example', button);
+  assert.equal(calls, 2);
+});
+
 test('custom CV recommendations are preselected but remain optional', () => {
   const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
   assert.match(html, /id="cv-option-xyz"[^>]*checked/);
@@ -153,6 +241,54 @@ test('configured triage thresholds drive score presentation', () => {
   assert.equal(scout.fitClass(81), 'fit-medium');
   assert.equal(scout.fitClass(64), 'fit-medium');
   assert.equal(scout.fitClass(63), 'fit-weak');
+});
+
+test('assessment-band entries disclose fixed bands and separate discovery relevance', () => {
+  const { scout, context } = loadScout();
+  const entry = {
+    score: 70, scoreBasis: 'assessment-band', discoveryScore: 24.13,
+    scoreBreakdown: { 'assessment-band': 70, 'mandatory-adjustment': 0 },
+  };
+  assert.match(scout.metaLine(entry), /Assessment band: Action; discovery relevance: 24\.13/);
+  assert.match(scout.assessmentScoreDisclosure({ score: 55, scoreBasis: 'assessment-band', discoveryScore: 82 }), /Assessment band: Check; discovery relevance: 82/);
+  scout.workspaceConfig = { triage: { actionScore: 82, checkScore: 64 } };
+  assert.match(scout.assessmentScoreDisclosure({ score: 70, scoreBasis: 'assessment-band' }), /Assessment band: Check/);
+  assert.match(scout.assessmentScoreDisclosure({ score: 60, scoreBasis: 'assessment-band' }), /Assessment band: Below check/);
+  assert.match(scout.detailHtml(entry), /Assessment band markers are not percentage fit scores/);
+  assert.match(scout.detailHtml(entry), /Discovery relevance: 24\.13/i);
+  assert.doesNotMatch(scout.metaLine({ score: 72, scoreBreakdown: { technical: 4 } }), /Assessment band|discovery relevance/i);
+
+  const body = { innerHTML: '' };
+  const overlay = { classList: { remove() {} } };
+  context.document.getElementById = (id) => id === 'scan-result-body' ? body : overlay;
+  context.requestAnimationFrame = () => {};
+  scout.latestScan = {
+    reviewed: [{ company: 'Synthetic', role: 'Engineer', outcome: 'kept', score: 70,
+      scoreBasis: 'assessment-band', discoveryScore: 24.13, reasons: [] }],
+    coverage: {}, explanations: [],
+    funnel: { assessed: 1 }, keepersAdded: 1,
+    runAt: '2026-10-23T10:00:00Z', advertsChecked: 60, advertsUnverified: 12, advertsClosed: 2,
+  };
+  scout.state.data = { opportunities: [] };
+  return scout.openScanResult().then(() => {
+    assert.match(body.innerHTML, /Assessment band markers are not percentage fit scores/);
+    assert.match(body.innerHTML, /Assessment band: Check; discovery relevance: 24\.13/);
+    assert.match(body.innerHTML, /Advert availability could not be verified for 12 links\. Open the source advert before applying\./);
+  });
+});
+
+test('latest scan card explains that advert checks are attempts and warns about unverified links', () => {
+  const { scout } = loadScout();
+  scout.scanRuns = [];
+  scout.scanQueue = { requests: [] };
+  scout.scanRunState = 'waiting';
+  scout.latestScan = {
+    runAt: '2026-10-23T10:00:00Z', funnel: { assessed: 60 }, keepersAdded: 28,
+    advertsChecked: 60, advertsUnverified: 12, advertsClosed: 2,
+  };
+  const html = scout.latestScanCard();
+  assert.match(html, /Advert link checks attempted: 60/);
+  assert.match(html, /Advert availability could not be verified for 12 links\. Open the source advert before applying\./);
 });
 
 test('Codex task controls escape fallback identity and never call a click success', () => {
@@ -449,6 +585,27 @@ test('run audit renders persisted recovery and queue state without private diagn
   assert.doesNotMatch(html, /PRIVATE-HOST|4242|private prompt|full advert body|private queued prompt/i);
 });
 
+test('run audit labels inactive incomplete scans as paused without promising recovery', () => {
+  const { scout } = loadScout();
+  scout.scanRuns = [{
+    id: 'run-1234…', state: 'collecting', label: 'Collecting vacancies', owner: null,
+    recoveryCount: 0, assessment: null,
+  }];
+  scout.scanQueue = { requests: [] };
+  assert.match(scout.scanRunAuditCard(), /Scan paused — no active worker/);
+});
+
+test('queued scan operations and inactive run progress are described honestly', () => {
+  const { scout, context } = loadScout();
+  const status = { textContent: '' };
+  context.document.getElementById = (id) => id === 'scan-status' ? status : null;
+  scout.showOperation({ type: 'scan', status: 'succeeded', result: { status: 'queued' } });
+  assert.match(status.textContent, /scan request queued/i);
+  assert.doesNotMatch(status.textContent, /scan completed/i);
+  assert.match(scout.scanProgressText({ label: 'Collecting vacancies', owner: null }), /Scan paused — no active worker/);
+  assert.match(scout.scanProgressText({ label: 'Collecting vacancies', owner: 'active worker' }), /Collecting vacancies/);
+});
+
 test('the Jobs audit remains visible for queue-only and waiting workspaces', () => {
   const { scout } = loadScout();
   scout.latestScan = null;
@@ -461,6 +618,56 @@ test('the Jobs audit remains visible for queue-only and waiting workspaces', () 
   assert.match(scout.latestScanCard(), /1 queued request/i);
   scout.scanQueue = { state: 'waiting', requests: [] };
   assert.match(scout.latestScanCard(), /Waiting to scan/i);
+});
+
+test('restart reconciliation lets an explicit scan recover stale durable claims', async () => {
+  const { scout, context } = loadScout();
+  const { doc } = withJobsDom();
+  context.document = doc;
+  let pollScheduled = false;
+  context.fetch = async () => ({ ok: true, json: async () => ({}) });
+  context.setTimeout = () => { pollScheduled = true; return 1; };
+  scout.api = async (route) => route === '/api/scan/runs'
+    ? { state: 'collecting', runs: [{ state: 'collecting', owner: null }] }
+    : { state: 'waiting', requests: [{ status: 'claimed', runId: 'run-old' }] };
+  scout.loadOpportunities = async () => {};
+
+  await scout.reattachScanOperation({ reconcileMissing: true });
+
+  assert.equal(scout.scanRunning, false);
+  assert.equal(doc.getElementById('scan-now').disabled, false);
+  assert.equal(doc.getElementById('scan-now').textContent, 'Scan now');
+  assert.equal(pollScheduled, false);
+});
+
+test('restart reconciliation keeps a live worker fenced and fails closed on unknown ownership', async () => {
+  for (const owner of ['active worker', 'unexpected']) {
+    const { scout, context } = loadScout();
+    const { doc } = withJobsDom();
+    context.document = doc;
+    let pollScheduled = false;
+    context.fetch = async () => ({ ok: true, json: async () => ({}) });
+    context.setTimeout = () => { pollScheduled = true; return 1; };
+    scout.api = async (route) => route === '/api/scan/runs'
+      ? { state: 'collecting', runs: [{ state: 'collecting', owner }] }
+      : { state: 'waiting', requests: [] };
+    scout.loadOpportunities = async () => {};
+
+    await scout.reattachScanOperation({ reconcileMissing: true });
+
+    assert.equal(scout.scanRunning, true);
+    assert.equal(doc.getElementById('scan-now').disabled, true);
+    assert.equal(pollScheduled, true);
+  }
+});
+
+test('commute public transport config selects the public filter without changing stored config', () => {
+  const { scout } = loadScout();
+  const config = { commute: { mode: 'public transport', maxMinutes: 35, includeUnknown: true } };
+  scout.applyWorkspaceConfig(config, { render: false });
+  assert.equal(scout.state.commute.mode, 'public');
+  assert.equal(config.commute.mode, 'public transport');
+  assert.equal(scout.workspaceConfig, config);
 });
 
 test('renderJobs lists only new jobs, highest score first, with tags and actions', () => {
@@ -487,6 +694,238 @@ test('renderJobs lists only new jobs, highest score first, with tags and actions
   assert.ok(html.indexOf('data-id="b"') < html.indexOf('data-id="a"')); // 90 before 60
   assert.doesNotMatch(html, /data-id="c"/); // shortlisted excluded
   assert.doesNotMatch(html, /data-id="s"/); // speculative excluded
+});
+
+test('Jobs shows a compact listing URL import form and preserves its draft across rerender', () => {
+  const { scout, context } = loadScout();
+  const { doc, sections } = withJobsDom();
+  const input = { value: 'https://jobs.example/role' };
+  doc.getElementById = (id) => id === 'job-import-url' ? input : (sections[id] ||= { innerHTML: '', classList: { toggle() {} } });
+  context.document = doc;
+  scout.filterBar = () => '';
+  scout.latestScanCard = () => '';
+  scout.state.data = { opportunities: [], workspaceConfig: { ai: { provider: 'codex' } } };
+  scout.renderJobs();
+  const html = doc.getElementById('tab-jobs').innerHTML;
+  assert.match(html, /Add job from URL/);
+  assert.match(html, /id="job-import-url"[^>]*type="url"/);
+  assert.match(html, /Import and score/);
+  assert.match(html, /configured AI provider/);
+  assert.match(html, /usual research and CV tools/i);
+  assert.ok(html.includes('value="https://jobs.example/role"'));
+});
+
+test('delegated job import submit prevents navigation, posts the URL, and persists input drafts', async () => {
+  const { scout, context } = loadScout();
+  const sections = {};
+  const input = { id: 'job-import-url', value: 'https://jobs.example/role' };
+  const advert = { id: 'job-import-advert', value: 'Synthetic advert draft' };
+  const listeners = new Map();
+  const doc = {
+    addEventListener: (name, handler) => listeners.set(name, handler),
+    getElementById: (id) => id === 'job-import-url' ? input : id === 'job-import-advert' ? advert : (sections[id] ||= { innerHTML: '', classList: { toggle() {} } }),
+    querySelectorAll: () => [],
+  };
+  context.document = doc;
+  const stored = new Map();
+  context.localStorage = { getItem: (key) => stored.get(key) || null, setItem: (key, value) => stored.set(key, value) };
+  scout.state.data = { opportunities: [] };
+  scout.filterBar = () => '';
+  scout.latestScanCard = () => '';
+  scout.watchJobImport = (id) => { scout.watchedOperation = id; };
+  const calls = [];
+  context.fetch = async (url, options) => {
+    calls.push([url, options]);
+    return { ok: true, json: async () => ({ operation: { id: 'import-1' } }) };
+  };
+  scout.bindDelegatedActions();
+
+  listeners.get('input')({ target: input });
+  listeners.get('input')({ target: advert });
+  const saved = JSON.parse(stored.get(scout.jobImportStorageKey));
+  assert.equal(saved.url, input.value);
+  assert.equal(saved.pastedAdvert, advert.value);
+  assert.match(scout.jobImportFormHtml(), /data-submit-action="job-import"/);
+
+  let prevented = false;
+  await listeners.get('submit')({
+    target: { dataset: { submitAction: 'job-import' } },
+    preventDefault() { prevented = true; },
+  });
+  assert.equal(prevented, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], '/api/jobs/import');
+  assert.equal(calls[0][1].method, 'POST');
+  assert.deepEqual(JSON.parse(calls[0][1].body), { url: input.value, pastedAdvert: advert.value });
+  assert.equal(scout.watchedOperation, 'import-1');
+});
+
+test('job URL import sends once and keeps submission disabled while the request is pending', async () => {
+  const { scout, context } = loadScout();
+  const { doc, sections } = withJobsDom();
+  const input = { value: 'https://jobs.example/role' };
+  doc.getElementById = (id) => id === 'job-import-url' ? input : (sections[id] ||= { innerHTML: '', classList: { toggle() {} } });
+  context.document = doc;
+  scout.state.data = { opportunities: [] };
+  scout.filterBar = () => '';
+  scout.latestScanCard = () => '';
+  let release;
+  let posts = 0;
+  context.fetch = (url, options) => {
+    posts += 1;
+    assert.equal(url, '/api/jobs/import');
+    assert.deepEqual(JSON.parse(options.body), { url: input.value });
+    return new Promise((resolve) => { release = resolve; });
+  };
+  let watched;
+  scout.watchJobImport = (id) => { watched = id; };
+  scout.renderJobs();
+  const pending = scout.importJobFromUrl();
+  await Promise.resolve();
+  await scout.importJobFromUrl();
+  assert.equal(posts, 1);
+  assert.equal(scout.jobImportBusy, true);
+  assert.match(sections['tab-jobs'].innerHTML, /Importing…/);
+  assert.match(sections['tab-jobs'].innerHTML, /disabled/);
+  release({ ok: true, json: async () => ({ operation: { id: 'import-1' } }) });
+  await pending;
+  assert.equal(watched, 'import-1');
+});
+
+test('job import offers pasted-advert fallback only for a blocked public fetch', async () => {
+  for (const reasonCode of ['source-unavailable', 'provider-error']) {
+    const { scout, context } = loadScout();
+    const { doc, sections } = withJobsDom();
+    doc.getElementById = (id) => sections[id] ||= { innerHTML: '', classList: { toggle() {} } };
+    context.document = doc;
+    scout.state.data = { opportunities: [] };
+    scout.filterBar = () => '';
+    scout.latestScanCard = () => '';
+    let timer;
+    context.setTimeout = (fn) => { timer = fn; return 1; };
+    context.clearTimeout = () => {};
+    context.fetch = async () => ({ ok: true, json: async () => ({ operation: {
+      id: 'import-1', status: 'succeeded', result: { ok: false, status: 'blocked', reasonCode },
+    } }) });
+    scout.watchJobImport('import-1');
+    await timer();
+    const html = sections['tab-jobs'].innerHTML;
+    if (reasonCode === 'source-unavailable') assert.match(html, /id="job-import-advert"/);
+    else assert.doesNotMatch(html, /id="job-import-advert"/);
+    assert.match(html, reasonCode === 'source-unavailable' ? /could not read the public listing/i : /could not verify one vacancy/i);
+  }
+});
+
+test('job import resolves entryId from the refreshed tracker and opens imported or duplicate records', async () => {
+  for (const status of ['imported', 'duplicate']) {
+    const { scout, context } = loadScout();
+    const { doc, sections } = withJobsDom();
+    const importUrl = { value: 'https://jobs.example/role' };
+    const pastedAdvert = { value: 'Advert draft' };
+    doc.getElementById = (id) => id === 'job-import-url' ? importUrl : id === 'job-import-advert' ? pastedAdvert : (sections[id] ||= { innerHTML: '', classList: { toggle() {} } });
+    context.document = doc;
+    const stored = new Map();
+    context.localStorage = { getItem: (key) => stored.get(key) || null, setItem: (key, value) => stored.set(key, value) };
+    let timer;
+    context.setTimeout = (fn) => { timer = fn; return 1; };
+    context.clearTimeout = () => {};
+    context.fetch = async () => ({ ok: true, json: async () => ({ operation: {
+      status: 'succeeded', result: { ok: true, status, entryId: 'saved-entry', warnings: ['Saved <b>warning</b>'] },
+    } }) });
+    const entry = { id: 'saved-entry', company: 'Example', role: 'Editor', status: 'new', notes: 'Saved assessment notes' };
+    scout.state.data = { opportunities: [entry] };
+    scout.loadOpportunities = async () => {};
+    const sequence = [];
+    const renderJobs = scout.renderJobs.bind(scout);
+    scout.renderJobs = () => { sequence.push('render'); renderJobs(); };
+    scout.openEntry = (tab, id) => { sequence.push('open'); scout.opened = [tab, id]; };
+    scout.filterBar = () => '';
+    scout.latestScanCard = () => '';
+    scout.jobImportDraft = importUrl.value;
+    scout.jobImportPastedAdvert = pastedAdvert.value;
+    scout.jobImportNeedsPaste = true;
+    scout.watchJobImport('operation-1');
+    await timer();
+    assert.deepEqual(scout.opened, ['jobs', 'saved-entry']);
+    assert.deepEqual(sequence.slice(-2), ['render', 'open']);
+    assert.equal(importUrl.value, '');
+    assert.equal(pastedAdvert.value, '');
+    assert.equal(scout.jobImportDraft, '');
+    assert.equal(scout.jobImportPastedAdvert, '');
+    assert.equal(JSON.parse(stored.get(scout.jobImportStorageKey)).url, '');
+    assert.equal(scout.jobImportOutcome.duplicate, status === 'duplicate');
+    assert.match(sections['tab-jobs'].innerHTML, /Saved &lt;b&gt;warning&lt;\/b&gt;/);
+    assert.match(scout.detailHtml(entry), /Saved assessment notes/);
+  }
+});
+
+test('URL credentials are rejected before they can be saved as an import draft', async () => {
+  const { scout, context } = loadScout();
+  const { doc, sections } = withJobsDom();
+  const input = { value: 'https://user:secret@jobs.example/role' };
+  doc.getElementById = (id) => id === 'job-import-url' ? input : (sections[id] ||= { innerHTML: '', classList: { toggle() {} } });
+  context.document = doc;
+  const stored = new Map();
+  context.localStorage = { getItem: (key) => stored.get(key) || null, setItem: (key, value) => stored.set(key, value) };
+  scout.state.data = { opportunities: [] };
+  scout.filterBar = () => '';
+  scout.latestScanCard = () => '';
+  let posts = 0;
+  context.fetch = async () => { posts += 1; throw new Error('must not post'); };
+  scout.jobImportDraft = input.value;
+  await scout.importJobFromUrl();
+  assert.equal(posts, 0);
+  assert.match(sections['tab-jobs'].innerHTML, /without a username or password/i);
+  assert.doesNotMatch(stored.get(scout.jobImportStorageKey), /secret|user/);
+});
+
+test('a failed import never offers pasted-ad fallback and uses its safe string error', async () => {
+  const { scout, context } = loadScout();
+  const { doc, sections } = withJobsDom();
+  context.document = doc;
+  let timer;
+  context.setTimeout = (fn) => { timer = fn; return 1; };
+  context.clearTimeout = () => {};
+  context.fetch = async () => ({ ok: true, json: async () => ({ operation: { status: 'failed', error: 'Workspace is busy.' } }) });
+  scout.state.data = { opportunities: [] };
+  scout.filterBar = () => '';
+  scout.latestScanCard = () => '';
+  scout.watchJobImport('operation-1');
+  await timer();
+  assert.match(sections['tab-jobs'].innerHTML, /Workspace is busy\./);
+  assert.doesNotMatch(sections['tab-jobs'].innerHTML, /job-import-advert/);
+});
+
+test('job import draft and pending operation survive reload, while repeated status network failures stop', async () => {
+  const saved = new Map();
+  const storage = { getItem: (key) => saved.get(key) || null, setItem: (key, value) => saved.set(key, value) };
+  const { scout, context } = loadScout();
+  context.localStorage = storage;
+  scout.jobImportDraft = 'https://jobs.example/role';
+  scout.jobImportPastedAdvert = 'Draft advert';
+  scout.jobImportOperationId = 'operation-1';
+  scout.saveJobImportState();
+  const reloaded = loadScout();
+  reloaded.context.localStorage = storage;
+  reloaded.scout.restoreJobImportState();
+  assert.equal(reloaded.scout.jobImportDraft, 'https://jobs.example/role');
+  assert.equal(reloaded.scout.jobImportPastedAdvert, 'Draft advert');
+  assert.equal(reloaded.scout.jobImportOperationId, 'operation-1');
+
+  const { doc, sections } = withJobsDom();
+  reloaded.context.document = doc;
+  let timer;
+  reloaded.context.setTimeout = (fn) => { timer = fn; return 1; };
+  reloaded.context.clearTimeout = () => {};
+  reloaded.context.fetch = async () => { throw new Error('offline'); };
+  reloaded.scout.state.data = { opportunities: [] };
+  reloaded.scout.filterBar = () => '';
+  reloaded.scout.latestScanCard = () => '';
+  reloaded.scout.watchJobImport('operation-1');
+  for (let i = 0; i < 5; i += 1) await timer();
+  assert.equal(reloaded.scout.jobImportBusy, false);
+  assert.match(sections['tab-jobs'].innerHTML, /Refresh this page to resume checking/);
+  assert.equal(reloaded.scout.jobImportOperationId, 'operation-1');
 });
 
 test('speculative classification uses the exact tag case-insensitively', () => {
@@ -528,6 +967,46 @@ test('renderSpeculative shows an empty state when nothing matches', () => {
   scout.state.data = { opportunities: [] };
   scout.renderSpeculative();
   assert.match(doc.getElementById('tab-speculative').innerHTML, /No speculative opportunities match/);
+});
+
+test('speculative view explains employer prospects and provides a creation path', () => {
+  const { scout, context } = loadScout();
+  const { doc } = withJobsDom();
+  context.document = doc;
+  scout.filterBar = () => '';
+  scout.state.data = { opportunities: [] };
+  scout.renderSpeculative();
+  const html = doc.getElementById('tab-speculative').innerHTML;
+  assert.match(html, /not confirmed vacancies/i);
+  assert.match(html, /data-action="toggle-prospect-form"/);
+  assert.match(html, /data-action="save-prospect"/);
+  assert.match(html, /id="prospect-careers-url"/);
+});
+
+test('job detail facts show estimates, unknown gates and escaped source information', () => {
+  const { scout } = loadScout();
+  const html = scout.advertFactsHtml({ advertFacts: {
+    compensation: { minimum: 30000, maximum: 40000, currency: 'GBP', period: 'year', certainty: 'estimated' },
+    workingPattern: 'hybrid', employmentType: 'permanent', hours: 'full-time', officeDays: null,
+    checkedAt: '2026-07-24', availability: 'unverified', sourceUrl: 'https://jobs.example/role',
+  } });
+  assert.match(html, /30,000/);
+  assert.match(html, /estimated/i);
+  assert.match(html, /Office days/);
+  assert.match(html, /Not stated/);
+  assert.match(html, /availability not verified/i);
+  assert.match(html, /Take-home pay/);
+  assert.match(html, /data-action="restore-advert-facts"/);
+  assert.match(html, /href="https:\/\/jobs.example\/role"/);
+  assert.doesNotMatch(scout.advertFactsHtml({ advertFacts: { sourceUrl: 'javascript:alert(1)' } }), /href="javascript/);
+  assert.doesNotMatch(scout.advertFactsHtml({}), /GBP 0/);
+});
+
+test('employer prospects do not claim advertised job conditions', () => {
+  const { scout } = loadScout();
+  const html = scout.advertFactsHtml({ opportunityKind: 'employer-prospect' });
+  assert.match(html, /no vacancy, salary or working arrangement is confirmed/i);
+  assert.doesNotMatch(html, /data-action="restore-advert-facts"/);
 });
 
 test('triage actions post the right status transitions', async () => {

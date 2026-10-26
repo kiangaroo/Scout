@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
-  assessScanCandidates, assessmentCandidatesForSelection, buildAssessmentPrompt, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, durableScanProjection, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
+  archiveStaleInboxEntries, assessScanCandidates, assessmentCandidatesForSelection, buildAssessmentPrompt, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, durableScanProjection, gateAssessment, inboxRecheckCandidates, mergeTracker, prepareRankedDiscovery, promptCandidate,
   filterVacancies, PipelineInterruptedError, readVacancyDecisionHistory, runScanPipeline, validateAssessments, validateWrittenScanArtifacts,
   verificationCandidates, writeScanArtifacts,
 } from './scanPipeline.mjs';
@@ -14,9 +14,11 @@ import {
   appendRunEvent, openRunJournal, replayRunJournal, validateRunJournal,
 } from './runJournal.mjs';
 import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
-import { applyPreparedMutation, prepareMutation } from './mutationCoordinator.mjs';
 import {
-  runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe,
+  applyPreparedMutation, loadPreparedMutation, prepareMutation, withMutationCoordinator,
+} from './mutationCoordinator.mjs';
+import {
+  renderMutationRecipe, runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe,
 } from './scanMutationProjection.mjs';
 import { profileRuleId } from './searchProfile.mjs';
 import { createEmployerRegistry, employerRegistryRevision } from './employerRegistry.mjs';
@@ -710,10 +712,27 @@ test('ranked discovery backfills assessment capacity instead of re-assessing an 
       url: rejected.url,
       source: rejected.source,
       outcome: 'below_threshold',
+      scoreBasis: 'assessment-band',
       profileId: profile.id,
       contentFingerprint: rejected.contentFingerprint,
     }],
     runId: 'repeat',
+    limit: 1,
+  });
+  const legacyResult = prepareRankedDiscovery({
+    sources,
+    profile,
+    tracker: { opportunities: [] },
+    decisionHistory: [{
+      company: rejected.company,
+      role: rejected.role,
+      url: rejected.url,
+      source: rejected.source,
+      outcome: 'below_threshold',
+      profileId: profile.id,
+      contentFingerprint: rejected.contentFingerprint,
+    }],
+    runId: 'legacy-repeat',
     limit: 1,
   });
 
@@ -726,6 +745,7 @@ test('ranked discovery backfills assessment capacity instead of re-assessing an 
   })), [{ company: 'Already Reviewed', reason: 'unchanged-rejection' }]);
   assert.equal(result.candidates.length, 1);
   assert.equal(result.funnel.selected, 1);
+  assert.equal(legacyResult.selection.assessmentSkipped.some((item) => item.company === 'Already Reviewed'), false);
 });
 
 test('published learning reranks unassessed jobs, reconsiders scoped exclusions and reuses prior decisions', () => {
@@ -775,6 +795,7 @@ test('published learning reranks unassessed jobs, reconsiders scoped exclusions 
       url: reviewed.url,
       source: reviewed.source,
       outcome: 'below_threshold',
+      scoreBasis: 'assessment-band',
       profileId: profile.id,
       contentFingerprint: reviewed.contentFingerprint,
     }],
@@ -1037,14 +1058,24 @@ test('normalized source requirement summaries are mandatory without keyword heur
 test('mandatory and recommendation gates use Scout deterministic scores and bands', () => {
   const candidate = { candidateId: 'candidate-001', preRankScore: 90 };
   assert.deepEqual(gateAssessment(assessment('unmet'), { actionScore: 70, checkScore: 55 }, candidate), {
-    eligibility: 'ineligible', score: 54, keep: false, reasons: ['AWS'],
+    eligibility: 'ineligible', score: 54, assessmentBand: 70, keep: false, reasons: ['AWS'],
   });
   assert.deepEqual(gateAssessment(assessment('unknown'), { actionScore: 70, checkScore: 55 }, candidate), {
-    eligibility: 'check', score: 69, keep: true, reasons: ['AWS'],
+    eligibility: 'check', score: 69, assessmentBand: 70, keep: true, reasons: ['AWS'],
   });
   const discarded = { ...assessment('met'), recommendation: 'discard' };
   assert.equal(gateAssessment(discarded, { actionScore: 70, checkScore: 55 }, candidate).keep, false);
-  assert.equal(gateAssessment(assessment('met'), { actionScore: 70, checkScore: 55 }, { preRankScore: 82 }).score, 82);
+  const lowDiscoveryKeep = gateAssessment(
+    assessment('met'), { actionScore: 70, checkScore: 55 }, { preRankScore: 24.13 },
+  );
+  assert.deepEqual(lowDiscoveryKeep, {
+    eligibility: 'eligible', score: 70, assessmentBand: 70, keep: true, reasons: [],
+  });
+  const highDiscoveryDiscard = gateAssessment(
+    discarded, { actionScore: 70, checkScore: 55 }, { preRankScore: 99 },
+  );
+  assert.equal(highDiscoveryDiscard.keep, false);
+  assert.equal(highDiscoveryDiscard.score, 0);
   assert.throws(
     () => validateAssessments(
       { assessments: [{ ...assessment('met'), dimensions }] },
@@ -1053,6 +1084,61 @@ test('mandatory and recommendation gates use Scout deterministic scores and band
     /assessment validation failed/,
   );
   assert.throws(() => validateAssessments({ assessments: [] }, [{ candidateId: 'candidate-001' }]), /covered 0 of 1/);
+});
+
+test('tracker score records assessment bands separately from discovery relevance', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-assessment-band-score-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
+  const candidates = [
+    {
+      candidateId: 'low-discovery-keep', company: 'Low Discovery', role: 'Engineer',
+      url: 'https://example.test/low', source: 'ats', preRankScore: 24.13,
+      dimensions: [{ name: 'responsibilities', score: 24.13 }],
+    },
+    {
+      candidateId: 'high-discovery-discard', company: 'High Discovery', role: 'Engineer',
+      url: 'https://example.test/high', source: 'ats', preRankScore: 99,
+      dimensions: [{ name: 'responsibilities', score: 99 }],
+    },
+    {
+      candidateId: 'unknown-mandatory', company: 'Unknown Requirement', role: 'Engineer',
+      url: 'https://example.test/unknown', source: 'ats', preRankScore: 95,
+      dimensions: [{ name: 'responsibilities', score: 95 }],
+    },
+  ];
+  const assessments = [
+    { ...assessment('met'), candidateId: 'low-discovery-keep' },
+    { ...assessment('met'), candidateId: 'high-discovery-discard', recommendation: 'discard' },
+    { ...assessment('unknown'), candidateId: 'unknown-mandatory' },
+  ];
+  try {
+    const artifacts = writeScanArtifacts(root, {
+      provider: 'codex', mode: 'primary', candidates,
+      sources: { ats: { configured: true, status: 'healthy', count: candidates.length } },
+      assessmentResult: { assessments }, policy: { actionScore: 70, checkScore: 55 },
+      startedAt: '2026-07-14T10:00:00Z',
+    });
+    const saved = artifacts.tracker.opportunities;
+    const low = saved.find((item) => item.company === 'Low Discovery');
+    const unknown = saved.find((item) => item.company === 'Unknown Requirement');
+    assert.equal(saved.some((item) => item.company === 'High Discovery'), false);
+    assert.equal(low.score, 70);
+    assert.deepEqual(low.scoreBreakdown, {
+      'assessment-band': 70,
+      'mandatory-adjustment': 0,
+    });
+    assert.equal(low.scoreBasis, 'assessment-band');
+    assert.equal(low.discoveryScore, 24.13);
+    assert.deepEqual(low.discoveryBreakdown, { responsibilities: 24.13 });
+    assert.equal(low.rankingHistory.at(-1).preRankScore, 24.13);
+    assert.equal(unknown.score, 69);
+    assert.equal(unknown.eligibility.status, 'check');
+    assert.equal(artifacts.run.discarded.provider_discarded, 1);
+    assert.equal(artifacts.run.discarded.mandatory_unmet, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('runtime writes canonical scan records and preserves user tracker state', () => {
@@ -1216,7 +1302,7 @@ test('forty zero-keeper candidates produce a bounded sanitised audit without tra
   assert.equal(artifacts.run.reviewed.length, 40);
   assert.deepEqual(Object.keys(artifacts.run.reviewed[0]).sort(), [
     'categoryId', 'company', 'contentFingerprint', 'learningVersionId', 'outcome', 'profileId', 'reasons',
-    'role', 'score', 'source', 'sourceReferences', 'sourceUrl', 'vacancyId',
+    'role', 'score', 'scoreBasis', 'source', 'sourceReferences', 'sourceUrl', 'vacancyId',
   ].sort());
   assert.doesNotMatch(JSON.stringify(artifacts.run.reviewed), /full advert|profileEvidence|Built systems/);
 
@@ -1226,7 +1312,7 @@ test('forty zero-keeper candidates produce a bounded sanitised audit without tra
   assert.match(history[0].contentFingerprint, /^[a-f0-9]{64}$/);
   assert.deepEqual(Object.keys(history[0]).sort(), [
     'assessedAt', 'company', 'contentFingerprint', 'learningVersionId', 'outcome', 'profileId',
-    'role', 'source', 'sourceReferences', 'url', 'vacancyId',
+    'role', 'scoreBasis', 'source', 'sourceReferences', 'url', 'vacancyId',
   ].sort());
 });
 
@@ -1768,6 +1854,62 @@ function durableStageHarness(calls) {
     };
   }]));
 }
+
+test('failed finalisation recovers its prepared mutation without rerunning collection stages', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-prepared-finalise-recovery-'));
+  const reportFile = path.join(root, 'reports', '2026-07-28.md');
+  fs.mkdirSync(path.dirname(reportFile), { recursive: true });
+  fs.writeFileSync(reportFile, '# Scout report\n\n## Headline\n\nBefore.\n');
+  const calls = new Map();
+  let firstFinalise = true;
+  const stages = durableStageHarness(calls);
+  const finalize = async ({ run, lease }) => {
+    if (firstFinalise) {
+      firstFinalise = false;
+      const plan = prepareMutation({ handle: run, lease }, {
+        id: 'prepared-finalise-recovery',
+        schemaVersion: 1,
+        files: [{ kind: 'report', key: 'report:2026-07-28' }],
+      }, {
+        'report:2026-07-28': scanReportRecipe({
+          date: '2026-07-28', degraded: false, coverage: [], actions: [], checks: [],
+          keeperCount: 0, discarded: {}, nearMisses: [], errors: [], runs: [],
+        }),
+      });
+      withMutationCoordinator(root, lease, () => applyPreparedMutation(plan, lease));
+      assert.fail('the nested final mutation should be fenced');
+    }
+    const prepared = [...run.events].reverse().find((event) => event.type === 'mutation.prepared');
+    assert.ok(prepared);
+    return {
+      schemaVersion: 1,
+      result: { ok: true },
+      mutationReceipt: applyPreparedMutation(
+        loadPreparedMutation(run, prepared.payload.reference.id), lease,
+      ),
+    };
+  };
+  try {
+    const failed = await runScanPipeline({
+      root, compatibility: RECOVERY_COMPATIBILITY, stages, finalize,
+    });
+    assert.equal(failed.outcome, 'failed');
+    assert.equal(readScanLease(root), null);
+    calls.clear();
+
+    const recovered = await runScanPipeline({
+      root, compatibility: RECOVERY_COMPATIBILITY, stages, finalize,
+    });
+    assert.equal(recovered.outcome, 'complete');
+    assert.equal(recovered.manifest.outcome, 'complete');
+    assert.equal(calls.size, 0, 'recovery should reuse all committed stages');
+    assert.equal(recovered.manifest.receipts.length, 1);
+    assert.match(fs.readFileSync(reportFile, 'utf8'), /scout-mutation:/);
+    assert.equal(readScanLease(root), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('legacy collect recovery preserves distinct sanitized query-addressed vacancies', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-legacy-query-recovery-'));
@@ -2536,6 +2678,94 @@ test('a transient provider-health lease is retried without queueing or stranding
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+test('a transient backup lease is retried without queueing the manual scan', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-backup-lease-race-'));
+  const backupLease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'backup', runId: 'backup-checkpoint', phase: 'checkpoint',
+  });
+  let waits = 0;
+  const calls = new Map();
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(calls),
+      async waitForTransientLease() {
+        waits += 1;
+        releaseScanLease(backupLease);
+      },
+      queue: {
+        compatibility: {
+          profileFingerprint: 'b'.repeat(64),
+          configFingerprint: 'c'.repeat(64),
+          schemaVersion: 1,
+        },
+        request: {
+          id: 'manual-backup-race', key: 'manual-backup-race',
+          requestedAt: '2026-07-29T08:00:00.000Z', expiresAt: '2026-07-30T08:00:00.000Z',
+          requester: 'manual', windowAt: null, purpose: 'manual-discovery',
+          compatibility: {
+            profileFingerprint: 'b'.repeat(64),
+            configFingerprint: 'c'.repeat(64),
+            schemaVersion: 1,
+          },
+        },
+        async run() { assert.fail('transient backup lease must not queue the scan'); },
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.equal(waits, 1);
+    assert.equal(projectScanQueue(root).requests.length, 0);
+    assert.equal(readScanLease(root), null);
+  } finally {
+    try { releaseScanLease(backupLease); } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an exhausted backup-lease retry fails explicitly without adding stranded queue work', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-backup-lease-bounded-'));
+  const backupLease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'backup', runId: 'backup-checkpoint', phase: 'checkpoint',
+  });
+  let waits = 0;
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      async waitForTransientLease() { waits += 1; },
+      queue: {
+        compatibility: {
+          profileFingerprint: 'b'.repeat(64),
+          configFingerprint: 'c'.repeat(64),
+          schemaVersion: 1,
+        },
+        request: {
+          id: 'manual-backup-timeout', key: 'manual-backup-timeout',
+          requestedAt: '2026-07-29T08:00:00.000Z', expiresAt: '2026-07-30T08:00:00.000Z',
+          requester: 'manual', windowAt: null, purpose: 'manual-discovery',
+          compatibility: {
+            profileFingerprint: 'b'.repeat(64),
+            configFingerprint: 'c'.repeat(64),
+            schemaVersion: 1,
+          },
+        },
+        async run() { assert.fail('a non-scan lease must not produce queued work'); },
+      },
+    });
+
+    assert.equal(result.outcome, 'failed');
+    assert.equal(result.failures[0].code, 'workspace-busy');
+    assert.equal(result.failures[0].message, 'another workspace operation is in progress');
+    assert.equal(waits, 64);
+    assert.equal(projectScanQueue(root).requests.length, 0);
+  } finally {
+    try { releaseScanLease(backupLease); } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('idle startup drains older compatible FIFO work before beginning an unqueued run', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pipeline-startup-fifo-'));
@@ -3096,7 +3326,7 @@ test('legacy stage artifacts preserve source order with exact semantic evidence 
 
 test('semantic artifacts provide bounded readable assessment facts without complete advert sentences', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-readable-semantic-evidence-'));
-  const description = 'Build distributed platforms for public services.';
+  const description = 'Build distributed platforms for public services. Three days per week in the office. This is a full-time role.';
   const requirement = 'Kubernetes is mandatory for production clusters.';
   const profile = {
     version: 1, status: 'published', id: 'profile-readable-evidence',
@@ -3126,6 +3356,14 @@ test('semantic artifacts provide bounded readable assessment facts without compl
                 url: 'https://example.test/jobs/readable',
                 description,
                 requirements: requirement,
+                workingPattern: 'hybrid',
+                employmentType: 'permanent',
+                salaryMin: 65000,
+                salaryMax: 75000,
+                salaryCurrency: 'GBP',
+                salaryPeriod: 'year',
+                salaryRateType: 'salary',
+                salaryCertainty: 'range',
               }],
             },
           },
@@ -3140,6 +3378,18 @@ test('semantic artifacts provide bounded readable assessment facts without compl
       candidate.mandatorySignals[0].text,
       'Advert mandatory requirement: kubernetes production clusters.',
     );
+    assert.deepEqual(candidate.advertFacts, {
+      compensation: {
+        minimum: 65000, maximum: 75000, currency: 'GBP', period: 'year',
+        rateType: 'salary', certainty: 'range',
+      },
+      workingPattern: 'hybrid', employmentType: 'permanent', hours: 'full-time',
+      officeDays: 3, sourceUrl: 'https://example.test/jobs/readable',
+      checkedAt: '2026-07-28', availability: 'unverified',
+    });
+    const selectedVacancy = result.stageOutputs.select.selection.selected[0];
+    assert.equal(selectedVacancy.description, '');
+    assert.deepEqual(selectedVacancy.advertFacts, candidate.advertFacts);
     const artifactDirectory = path.join(root, '.scout', 'runs', result.runId, 'artifacts');
     const persisted = fs.readdirSync(artifactDirectory)
       .map((name) => fs.readFileSync(path.join(artifactDirectory, name), 'utf8'))
@@ -3150,6 +3400,98 @@ test('semantic artifacts provide bounded readable assessment facts without compl
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('selected advert facts survive assessment-to-tracker mutation without storing advert text', () => {
+  const url = 'https://example.test/jobs/producer-1?utm_source=campaign';
+  const fullAdvert = 'Three days per week in the office. This is a full-time permanent hybrid role.';
+  const selected = [{
+    vacancyId: 'vacancy-producer-1',
+    employer: { value: 'Example Co', provenance: 'explicit-source' },
+    title: { value: 'Producer', provenance: 'explicit-source' },
+    location: { value: 'London', provenance: 'explicit-source' },
+    canonicalUrl: url,
+    workingPattern: { value: 'hybrid', provenance: 'explicit-source' },
+    employmentType: { value: 'permanent', provenance: 'explicit-source' },
+    compensation: { value: {
+      minimum: 60000, maximum: 70000, currency: 'GBP', period: 'year',
+      rateType: 'salary', certainty: 'range',
+    }, provenance: 'explicit-source' },
+    observations: [{
+      source: 'ats', sourceRecordId: 'producer-1', sourceUrl: url,
+      fetchedAt: '2026-10-24T09:00:00.000Z', description: fullAdvert,
+    }],
+    sourceReferences: [{ source: 'ats', providerId: 'producer-1', url }],
+    semanticEvidence: { descriptionPresent: true, responsibilityFacts: [], mandatorySignals: [] },
+  }];
+  const candidates = assessmentCandidatesForSelection(selected);
+  const candidate = candidates[0];
+  assert.deepEqual(candidate.advertFacts, {
+    compensation: {
+      minimum: 60000, maximum: 70000, currency: 'GBP', period: 'year',
+      rateType: 'salary', certainty: 'range',
+    },
+    workingPattern: 'hybrid', employmentType: 'permanent', hours: 'full-time',
+    officeDays: 3, sourceUrl: 'https://example.test/jobs/producer-1',
+    checkedAt: '2026-10-24', availability: 'unverified',
+  });
+  assert.equal(Object.hasOwn(promptCandidate(candidate), 'advertFacts'), false);
+
+  const merged = mergeTracker(
+    { updated: '2026-10-23', opportunities: [] },
+    candidates,
+    [{ ...assessment('met'), candidateId: candidate.candidateId }],
+    { actionScore: 70, checkScore: 55 },
+    '2026-10-24',
+    'profile-advert-facts',
+  );
+  const current = JSON.stringify({ updated: '2026-10-23', opportunities: [] });
+  const recipe = trackerMergeRecipe(current, JSON.stringify(merged.tracker));
+  const tracker = JSON.parse(renderMutationRecipe('tracker', current, recipe));
+  assert.deepEqual(tracker.opportunities[0].advertFacts, candidate.advertFacts);
+  assert.doesNotMatch(JSON.stringify({ candidate, merged, recipe, tracker }), /Three days per week|full-time permanent hybrid role/i);
+});
+
+test('assessment candidate keeps existing advert facts when selected observations have no description', () => {
+  const existingFacts = {
+    compensation: {
+      minimum: 50000, maximum: null, currency: 'GBP', period: 'year',
+      rateType: 'salary', certainty: 'exact',
+    },
+    workingPattern: 'hybrid', employmentType: 'permanent', hours: 'part-time',
+    officeDays: 2, sourceUrl: 'https://example.test/jobs/known',
+    checkedAt: '2026-10-23', availability: 'unverified',
+  };
+  const candidate = assessmentCandidatesForSelection([{
+    vacancyId: 'vacancy-existing-facts', company: 'Example Co', title: 'Editor',
+    url: 'https://example.test/jobs/known', canonicalUrl: 'https://example.test/jobs/known',
+    advertFacts: existingFacts,
+    observations: [{ sourceUrl: 'https://example.test/jobs/known', fetchedAt: null }],
+  }])[0];
+  assert.deepEqual(candidate.advertFacts, existingFacts);
+});
+
+test('inbox liveness checks and stale archiving skip employer prospects and legacy speculative tags', () => {
+  const tracker = { opportunities: [
+    { id: 'active-role', status: 'new', sources: ['https://example.test/jobs/role'] },
+    { id: 'typed-prospect', status: 'new', type: 'employer-prospect', sources: ['https://example.test/careers'] },
+    { id: 'kind-prospect', status: 'new', opportunityKind: 'employer-prospect', sources: ['https://example.test/jobs'] },
+    { id: 'legacy-prospect', status: 'new', tags: [' SPECULATIVE OUTREACH '], sources: ['https://example.test/careers'] },
+  ] };
+  const candidates = inboxRecheckCandidates(tracker);
+  assert.deepEqual(candidates.checkable.map((item) => item._trackerId), ['active-role']);
+  assert.deepEqual(candidates.missingSource, []);
+
+  archiveStaleInboxEntries(tracker, [
+    ...tracker.opportunities.map((entry) => ({
+      _trackerId: entry.id,
+      liveness: { state: 'gone', reason: 'synthetic unavailable response' },
+    })),
+  ], '2026-10-24');
+  assert.equal(tracker.opportunities[0].status, 'ignore');
+  assert.equal(tracker.opportunities[1].status, 'new');
+  assert.equal(tracker.opportunities[2].status, 'new');
+  assert.equal(tracker.opportunities[3].status, 'new');
 });
 
 test('fresh scan refuses storage pressure before its first lease, queue or journal append', async () => {

@@ -236,6 +236,52 @@ const Scout = {
   discoveryTimer: null,
   scanRunning: false,
   scanOperationTimer: null,
+  jobImportTimer: null,
+  jobImportBusy: false,
+  jobImportDraft: '',
+  jobImportPastedAdvert: '',
+  jobImportNeedsPaste: false,
+  jobImportMessage: '',
+  jobImportOutcome: null,
+  jobImportOperationId: null,
+  jobImportStorageKey: 'scout.job-import.v1',
+
+  restoreJobImportState() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(this.jobImportStorageKey) || '{}');
+      this.jobImportDraft = typeof saved.url === 'string' ? saved.url : '';
+      this.jobImportPastedAdvert = typeof saved.pastedAdvert === 'string' ? saved.pastedAdvert : '';
+      this.jobImportOperationId = typeof saved.operationId === 'string' ? saved.operationId : null;
+      this.jobImportBusy = Boolean(this.jobImportOperationId);
+      this.jobImportNeedsPaste = Boolean(saved.needsPaste);
+      this.jobImportMessage = this.jobImportBusy ? 'Resuming import status check…' : '';
+    } catch {
+      this.jobImportDraft = '';
+      this.jobImportPastedAdvert = '';
+      this.jobImportOperationId = null;
+    }
+  },
+
+  saveJobImportState() {
+    try {
+      let storedUrl = '';
+      try {
+        const parsed = new URL(this.jobImportDraft);
+        if (['http:', 'https:'].includes(parsed.protocol) && !parsed.username && !parsed.password) storedUrl = this.jobImportDraft;
+      } catch { /* Do not persist malformed or credential-bearing URL drafts. */ }
+      localStorage.setItem(this.jobImportStorageKey, JSON.stringify({
+        url: storedUrl,
+        pastedAdvert: this.jobImportPastedAdvert,
+        operationId: this.jobImportOperationId,
+        needsPaste: this.jobImportNeedsPaste,
+      }));
+    } catch { /* Storage can be unavailable in private browsing. */ }
+  },
+
+  clearJobImportOperation() {
+    this.jobImportOperationId = null;
+    this.saveJobImportState();
+  },
   latestScan: null,
   feedbackLearning: null,
   lastSyncPullAt: null,
@@ -350,7 +396,15 @@ const Scout = {
     }
   },
   primarySource(e) {
-    return (e.sources && e.sources[0]) ? this.safeHref(e.sources[0]) : '';
+    return (Array.isArray(e?.sources) ? e.sources : []).map((url) => this.safeHref(url)).find(Boolean) || '';
+  },
+  sourceRecoveryHtml(e) {
+    const label = (value) => String(value || '').replace(/["\r\n\t]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+    const company = label(e?.company);
+    const role = label(e?.role);
+    if (!company || !role || e?.opportunityKind === 'employer-prospect' || e?.type === 'employer-prospect') return '';
+    const href = this.safeHref(`https://www.google.com/search?q=${encodeURIComponent(`"${company}" "${role}"`)}`);
+    return `<p class="meta"><a href="${href}" target="_blank" rel="noopener noreferrer">Search for this job ↗</a> — opens Google with the employer and title. Results are not verified; check the employer, location, closing date and job reference before using another advert.</p>`;
   },
 
   async loadOpportunities({ durableRuns: suppliedRuns, durableQueue: suppliedQueue } = {}) {
@@ -382,7 +436,7 @@ const Scout = {
     const status = document.getElementById('scan-status');
     if (status && !this.scanRunning) {
       status.textContent = activeRun
-        ? `${activeRun.label || 'Scan in progress'}${activeRun.assessment?.totalBatches ? ` · batch ${activeRun.assessment.currentBatch} of ${activeRun.assessment.totalBatchesExact ? '' : 'at least '}${activeRun.assessment.totalBatches}` : ''}`
+        ? `${this.scanProgressText(activeRun)}${activeRun.assessment?.totalBatches ? ` · batch ${activeRun.assessment.currentBatch} of ${activeRun.assessment.totalBatchesExact ? '' : 'at least '}${activeRun.assessment.totalBatches}` : ''}`
         : queuedCount
         ? `${queuedCount} queued ${queuedCount === 1 ? 'request' : 'requests'}`
         : h?.lastRunAt
@@ -444,16 +498,37 @@ const Scout = {
         remaining = lowMinutes < 1 ? `about ${highMinutes} min or less remaining` : `about ${lowMinutes}–${highMinutes} min remaining`;
       }
     }
-    status.textContent = operation.status === 'failed'
+    status.textContent = operation.result?.status === 'queued'
+      ? 'Scan request queued — waiting for its turn.'
+      : operation.status === 'failed'
       ? `Scan needs attention: ${operation.error || 'unknown error'}`
       : operation.status === 'succeeded' ? 'Scan completed — refreshing results…'
         : `${operation.phase || 'Scout is searching'} · ${step} · ${elapsed}${remaining ? ` · ${remaining}` : ''}`;
+  },
+
+  scanProgressText(run) {
+    return run?.owner ? (run.label || 'Scan in progress') : 'Scan paused — no active worker';
   },
 
   discardBreakdown(scan = this.latestScan || this.state.data?.scanHealth) {
     const labels = { hard_exclusion: 'hard exclusions', mandatory_unmet: 'mandatory gates', below_threshold: 'below threshold', provider_discarded: 'assessment discards' };
     return Object.entries(scan?.discarded || {}).filter(([, count]) => Number(count) > 0)
       .map(([key, count]) => `${count} ${labels[key] || key.replaceAll('_', ' ')}`).join(', ');
+  },
+
+  advertLivenessDisclosure(scan) {
+    const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 10_000 ? value : null;
+    const checked = count(scan?.advertsChecked);
+    const unverified = count(scan?.advertsUnverified);
+    const closed = count(scan?.advertsClosed);
+    const hasCounts = checked !== null || unverified !== null || closed !== null;
+    const summary = hasCounts
+      ? `<p class="meta">Advert link checks attempted: ${this.esc(checked ?? 'unknown')}. ${this.esc(unverified ?? 0)} unverified · ${this.esc(closed ?? 0)} confirmed closed. An attempted check does not confirm current availability.</p>`
+      : '';
+    const warning = unverified > 0
+      ? `<div class="setup-callout"><strong>Advert availability could not be verified for ${this.esc(unverified)} links. Open the source advert before applying.</strong></div>`
+      : '';
+    return summary + warning;
   },
 
   latestScanCard() {
@@ -464,6 +539,7 @@ const Scout = {
     return `${audit}<div class="card scan-result-card">
       <div class="top"><b>Latest scan result</b><span class="chip">${this.esc(scan.degraded ? 'degraded' : 'complete')}</span></div>
       <p><strong>${this.esc(scan.funnel?.assessed ?? scan.candidatesFound)} assessed, ${this.esc(scan.keepersAdded)} kept</strong>${this.discardBreakdown(scan) ? ` — ${this.esc(this.discardBreakdown(scan))}` : ''}${this.esc(broadened)}.</p>
+      ${this.advertLivenessDisclosure(scan)}
       <p class="meta">Zero keepers can be a valid result: Scout keeps approved gates in force even when it broadens discovery.</p>
       <div class="controls"><button class="act" data-action="open-scan-result">Review this scan</button>${scan.reportDate ? `<button class="act" data-action="open-scan-report" data-date="${this.esc(scan.reportDate)}">Open dated report</button>` : ''}</div>
     </div>`;
@@ -486,9 +562,13 @@ const Scout = {
     const recoveryText = `${recoveries} ${recoveries === 1 ? 'recovery' : 'recoveries'}`;
     const queueText = `${queued.length} queued ${queued.length === 1 ? 'request' : 'requests'}`;
     const terminal = run?.terminalReason ? ` · ${this.esc(run.terminalReason)}` : '';
+    const incomplete = run && !['complete', 'partial', 'abandoned', 'failed'].includes(run.state);
+    const runLabel = incomplete && !run.owner
+      ? 'Scan paused — no active worker'
+      : (run?.label || run?.state);
     return `<div class="card scan-run-audit">
       <div class="top"><b>Durable scan state</b><span class="chip">${this.esc(run?.state || 'queued')}</span></div>
-      ${run ? `<p><strong>${this.esc(run.label || run.state)}</strong>${batch}${terminal}</p>
+      ${run ? `<p><strong>${this.esc(runLabel)}</strong>${batch}${terminal}</p>
         <div class="meta">run ${this.esc(run.id)} · ${this.esc(run.owner || 'inactive worker')} · ${this.esc(recoveryText)}</div>` : ''}
       <div class="meta">${this.esc(queueText)}</div>
     </div>`;
@@ -577,6 +657,7 @@ const Scout = {
         throw new Error('durable scan state is invalid');
       }
       if (!durableRuns.runs.every((run) => DURABLE_RUN_STATES.has(run?.state))
+        || !durableRuns.runs.every((run) => run.owner === null || run.owner === 'active worker')
         || durableRuns.state !== (durableRuns.runs[0]?.state || 'waiting')
         || !durableQueue.requests.every(
           (request) => ACTIVE_QUEUE_STATES.has(request?.status)
@@ -588,12 +669,9 @@ const Scout = {
         throw new Error('durable scan state is invalid');
       }
       const activeRun = durableRuns.runs.some(
-        (run) => !TERMINAL_RUN_STATES.has(run.state),
+        (run) => !TERMINAL_RUN_STATES.has(run.state) && run.owner === 'active worker',
       );
-      const queued = durableQueue.requests.some(
-        (request) => ACTIVE_QUEUE_STATES.has(request.status),
-      );
-      if (activeRun || queued) {
+      if (activeRun) {
         this.scanRunning = true;
         if (button) { button.disabled = true; button.textContent = 'Scanning…'; }
         await this.loadOpportunities({ durableRuns, durableQueue });
@@ -769,10 +847,26 @@ const Scout = {
     bits.push(this.categoryOf(e));
     const commute = this.commuteLine(e);
     if (commute) bits.push(commute);
+    const assessmentScore = this.assessmentScoreDisclosure(e);
+    if (assessmentScore) bits.push(assessmentScore);
     const current = this.currentStage(e);
     if (current) bits.push(`current: ${current}`);
     const checked = e.lastChecked ? ` - checked ${this.esc(e.lastChecked)}` : '';
     return this.esc(bits.join(' - ')) + checked;
+  },
+
+  assessmentScoreDisclosure(entry) {
+    if (entry?.scoreBasis !== 'assessment-band') return '';
+    const score = Number(entry.score);
+    const { actionScore, checkScore } = this.triagePolicy();
+    const band = Number.isFinite(score) && score >= actionScore
+      ? 'Action'
+      : Number.isFinite(score) && score >= checkScore ? 'Check' : 'Below check';
+    const discoveryScore = entry.discoveryScore;
+    const discovery = typeof discoveryScore === 'number' && Number.isFinite(discoveryScore)
+      ? `; discovery relevance: ${discoveryScore}`
+      : '';
+    return `Assessment band: ${band}${discovery}`;
   },
 
   tagHtml(e) {
@@ -835,7 +929,8 @@ const Scout = {
     this.workspaceConfig = config || null;
     const commute = config?.commute;
     if (commute) {
-      if (['either', 'car', 'public', 'any'].includes(commute.mode)) this.state.commute.mode = commute.mode;
+      const mode = commute.mode === 'public transport' ? 'public' : commute.mode;
+      if (['either', 'car', 'public', 'any'].includes(mode)) this.state.commute.mode = mode;
       if (Number.isFinite(Number(commute.maxMinutes))) this.state.commute.maxMinutes = String(commute.maxMinutes);
       if (typeof commute.includeUnknown === 'boolean') this.state.commute.includeUnknown = commute.includeUnknown;
     }
@@ -868,6 +963,11 @@ const Scout = {
 
   renderJobs() {
     if (!this.state.data) return;
+    const importInput = document.getElementById('job-import-url');
+    const advertInput = document.getElementById('job-import-advert');
+    if (importInput) this.jobImportDraft = importInput.value;
+    if (advertInput) this.jobImportPastedAdvert = advertInput.value;
+    this.saveJobImportState();
     const target = document.getElementById('tab-jobs');
     if (!target) return;
     const entries = this.filteredEntries('all')
@@ -877,9 +977,159 @@ const Scout = {
       ? entries.map((e) => this.triageCardHtml(e)).join('')
       : (this.latestScanCard() || '<p class="inbox-empty">All caught up - nothing new to review.</p>');
     target.innerHTML = this.filterBar()
+      + this.jobImportFormHtml()
       + `<div class="label">${entries.length} new job${entries.length === 1 ? '' : 's'} to review</div>`
       + list;
     this.updateJobsBadge(entries.length);
+  },
+
+  jobImportFormHtml() {
+    const outcome = this.jobImportOutcome;
+    const entry = outcome?.entry;
+    const link = entry?.id
+      ? `<button class="act" data-action="open-entry" data-tab="${this.esc(this.tabForEntry(entry))}" data-id="${this.esc(entry.id)}">${outcome.duplicate ? 'View existing job' : 'Open imported job'}</button>`
+      : '';
+    const warning = (outcome?.warnings || []).length
+      ? `<p class="meta">${(outcome.warnings || []).map((warningText) => this.esc(warningText)).join(' ')}</p>` : '';
+    return `<form id="job-import-form" class="job-import-form" data-submit-action="job-import" aria-label="Add job from URL">
+      <label for="job-import-url">Add job from URL</label>
+      <div class="controls"><input id="job-import-url" name="url" type="url" inputmode="url" autocomplete="url" maxlength="2048" placeholder="https://employer.example/jobs/role" required value="${this.esc(this.jobImportDraft)}" ${this.jobImportBusy ? 'disabled' : ''}>
+        <button class="act primary" type="submit" ${this.jobImportBusy ? 'disabled' : ''}>${this.jobImportBusy ? 'Importing…' : 'Import and score'}</button></div>
+      <p class="meta">Paste one public listing URL. Scout uses your configured AI provider and its existing allowance. The imported job keeps the usual research and CV tools.</p>
+      ${this.jobImportNeedsPaste ? `<label for="job-import-advert">Paste the advert text to continue</label><textarea id="job-import-advert" name="pastedAdvert" maxlength="100000" rows="5" ${this.jobImportBusy ? 'disabled' : ''}>${this.esc(this.jobImportPastedAdvert)}</textarea><button class="act" type="submit" ${this.jobImportBusy ? 'disabled' : ''}>Retry with pasted advert</button>` : ''}
+      <div id="job-import-status" class="meta" role="status" aria-live="polite">${this.esc(this.jobImportMessage)}${outcome ? ` ${outcome.duplicate ? 'This listing was already tracked; its saved record was left unchanged.' : 'Job imported and scored.'}` : ''}</div>
+      ${warning}${link}
+    </form>`;
+  },
+
+  async importJobFromUrl() {
+    if (this.jobImportBusy) return;
+    const urlInput = document.getElementById('job-import-url');
+    const advertInput = document.getElementById('job-import-advert');
+    const url = String(urlInput?.value || this.jobImportDraft || '').trim();
+    const pastedAdvert = String(advertInput?.value || this.jobImportPastedAdvert || '').trim();
+    this.jobImportDraft = url;
+    this.jobImportPastedAdvert = pastedAdvert;
+    this.jobImportOutcome = null;
+    this.jobImportNeedsPaste = false;
+    this.jobImportMessage = '';
+    try {
+      const parsed = new URL(url);
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error('Use a public HTTP or HTTPS listing URL without a username or password.');
+    } catch (error) {
+      this.jobImportMessage = error.message.startsWith('Use a public HTTP') ? error.message : 'Enter a valid public listing URL.';
+      this.renderJobs();
+      return;
+    }
+    this.saveJobImportState();
+    this.jobImportBusy = true;
+    this.jobImportMessage = 'Starting import…';
+    this.renderJobs();
+    try {
+      const response = await fetch('/api/jobs/import', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ url, ...(pastedAdvert ? { pastedAdvert } : {}) }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        this.jobImportBusy = false;
+        this.jobImportMessage = body.error || 'The job import could not start.';
+        this.jobImportNeedsPaste = body.reasonCode === 'source-unavailable';
+        this.saveJobImportState();
+        this.renderJobs();
+        return;
+      }
+      if (!body.operation?.id) throw new Error('Scout did not return an import operation.');
+      this.jobImportOperationId = body.operation.id;
+      this.saveJobImportState();
+      this.jobImportMessage = 'Importing the listing and scoring it…';
+      this.renderJobs();
+      this.watchJobImport(body.operation.id);
+    } catch (error) {
+      this.jobImportBusy = false;
+      this.jobImportMessage = error.message || 'The job import could not start.';
+      this.clearJobImportOperation();
+      this.renderJobs();
+    }
+  },
+
+  watchJobImport(id) {
+    if (this.jobImportTimer) clearTimeout(this.jobImportTimer);
+    this.jobImportOperationId = id;
+    this.jobImportBusy = true;
+    this.saveJobImportState();
+    let consecutiveErrors = 0;
+    const poll = async () => {
+      try {
+        const response = await fetch(`/api/operations/${encodeURIComponent(id)}`);
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || !body.operation) throw new Error(body.error || 'Import status is unavailable.');
+        consecutiveErrors = 0;
+        const operation = body.operation;
+        if (['queued', 'running'].includes(operation.status)) {
+          this.jobImportMessage = operation.phase || 'Importing the listing and scoring it…';
+          this.renderJobs();
+          this.jobImportTimer = setTimeout(poll, 1000);
+          return;
+        }
+        this.jobImportTimer = null;
+        this.jobImportBusy = false;
+        this.clearJobImportOperation();
+        let entryToOpen = null;
+        if (operation.status === 'succeeded' && ['imported', 'duplicate'].includes(operation.result?.status)) {
+          const entryId = operation.result.entryId;
+          this.jobImportDraft = '';
+          this.jobImportPastedAdvert = '';
+          this.jobImportNeedsPaste = false;
+          const urlInput = document.getElementById('job-import-url');
+          const advertInput = document.getElementById('job-import-advert');
+          if (urlInput) urlInput.value = '';
+          if (advertInput) advertInput.value = '';
+          this.saveJobImportState();
+          let refreshed = true;
+          try { await this.loadOpportunities(); } catch { refreshed = false; }
+          const entry = this.state.data?.opportunities?.find((item) => item.id === entryId) || null;
+          this.jobImportDraft = '';
+          this.jobImportPastedAdvert = '';
+          this.jobImportNeedsPaste = false;
+          this.saveJobImportState();
+          this.jobImportOutcome = {
+            entry, duplicate: operation.result.status === 'duplicate',
+            warnings: Array.isArray(operation.result.warnings) ? operation.result.warnings : [],
+          };
+          this.jobImportMessage = refreshed && entry
+            ? ''
+            : 'Import completed, but Scout could not load the saved job. Refresh to view it.';
+          if (entry?.id) entryToOpen = entry;
+        } else if (operation.status === 'succeeded' && operation.result?.ok === false && operation.result?.status === 'blocked') {
+          this.jobImportMessage = operation.result.reasonCode === 'source-unavailable'
+            ? 'Scout could not read the public listing. Paste the advert text to continue.'
+            : `Scout could not verify one vacancy (${this.esc(operation.result.reasonCode || 'blocked')}).`;
+          this.jobImportNeedsPaste = operation.result.reasonCode === 'source-unavailable';
+          this.saveJobImportState();
+        } else {
+          this.jobImportMessage = typeof operation.error === 'string' ? operation.error : 'The listing could not be imported.';
+          this.jobImportNeedsPaste = false;
+          this.saveJobImportState();
+        }
+        this.renderJobs();
+        if (entryToOpen?.id) this.openEntry(this.tabForEntry(entryToOpen), entryToOpen.id);
+      } catch {
+        consecutiveErrors += 1;
+        if (consecutiveErrors >= 5) {
+          this.jobImportTimer = null;
+          this.jobImportBusy = false;
+          this.jobImportMessage = 'Could not check import status after several attempts. Refresh this page to resume checking.';
+          this.saveJobImportState();
+          this.renderJobs();
+          return;
+        }
+        this.jobImportMessage = 'Checking import status…';
+        this.renderJobs();
+        this.jobImportTimer = setTimeout(poll, 1000);
+      }
+    };
+    this.jobImportTimer = setTimeout(poll, 250);
   },
 
   renderSpeculative() {
@@ -901,8 +1151,47 @@ const Scout = {
       .map(([label, items]) => `<div class="label">${label} (${items.length})</div>${items.map((e) => this.cardHtml(e)).join('')}`)
       .join('');
     target.innerHTML = this.filterBar()
+      + '<p class="meta">Employer prospects are not confirmed vacancies. Use this list to research organisations and plan an enquiry. Normal vacancy scans do not automatically generate speculative prospects. Nothing is sent on your behalf.</p>'
+      + '<button class="act" data-action="toggle-prospect-form">Add employer prospect</button>'
+      + `<div id="prospect-form" ${this.prospectFormOpen ? '' : 'hidden'}>
+        <label class="setup-field">Employer<input id="prospect-company" maxlength="120" autocomplete="organization"></label>
+        <label class="setup-field">Official careers or organisation HTTPS URL<input id="prospect-careers-url" type="url" placeholder="https://example.org/careers"></label>
+        <label class="setup-field">Work to explore (optional)<input id="prospect-role-focus" maxlength="120"></label>
+        <label class="setup-field">Location (optional; does not confirm a commute)<input id="prospect-location" maxlength="160"></label>
+        <label class="setup-field">Why investigate this employer, and what needs checking?<textarea id="prospect-interest" maxlength="1000"></textarea></label>
+        <p class="meta">Add a researched lead, not an invented job. Salary, attendance, vacancy availability and fit remain unconfirmed.</p>
+        <button class="act primary" data-action="save-prospect">Save employer prospect</button>
+        <div id="prospect-message" role="status"></div>
+      </div>`
       + `<div class="label">Speculative opportunities (${entries.length})</div>`
       + (list || '<p class="inbox-empty">No speculative opportunities match the current commute filter.</p>');
+  },
+
+  toggleProspectForm() {
+    this.prospectFormOpen = !this.prospectFormOpen;
+    const form = document.getElementById('prospect-form');
+    if (form) form.hidden = !this.prospectFormOpen;
+    if (this.prospectFormOpen) document.getElementById('prospect-company')?.focus();
+  },
+
+  async saveProspect() {
+    const value = (id) => String(document.getElementById(id)?.value || '').trim();
+    const payload = { company: value('prospect-company'), careersUrl: value('prospect-careers-url'), roleFocus: value('prospect-role-focus'), location: value('prospect-location'), interest: value('prospect-interest') };
+    const message = document.getElementById('prospect-message');
+    if (!payload.company || !payload.careersUrl || !payload.interest) {
+      if (message) message.textContent = 'Enter the employer, official HTTPS URL and your reason for investigating.';
+      return;
+    }
+    const result = await this.post('/api/speculative', payload);
+    if (result?.ok) {
+      this.prospectFormOpen = false;
+      this.renderSpeculative();
+    }
+  },
+
+  async restoreAdvertFacts() {
+    const result = await this.post('/api/advert-facts/restore', {});
+    if (result?.ok) alert(`${Number(result.restoredJobs || 0)} jobs gained saved facts.${result.skippedRuns ? ` ${Number(result.skippedRuns)} unreadable scan records were skipped.` : ''} This does not recheck whether an advert is still open. Remaining unknowns need the original advert or employer confirmation.`);
   },
 
   updateJobsBadge(count) {
@@ -1045,10 +1334,16 @@ const Scout = {
     };
     const reasonText = (code) => reasonLabels[code]
       || String(code || 'not-selected').replaceAll('-', ' ').replace(/^./, (letter) => letter.toUpperCase());
+    const assessmentBandRows = (scan.reviewed || []).filter(
+      (item) => item?.scoreBasis === 'assessment-band',
+    );
+    const scoreExplanation = assessmentBandRows.length
+      ? '<div class="setup-callout"><strong>Assessment band markers are not percentage fit scores.</strong><p>Discovery relevance is a separate signal and is shown separately for each reviewed role.</p></div>'
+      : '';
     const groups = Object.entries(labels).map(([outcome, label]) => {
       const items = (scan.reviewed || []).filter((item) => item.outcome === outcome).sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
       if (!items.length) return '';
-      return `<details ${outcome !== 'kept' ? 'open' : ''}><summary>${this.esc(label)} (${items.length})</summary><div class="scan-review-list">${items.map((item) => `<article class="scan-review-item"><div><b>${this.esc(item.company)} — ${this.esc(item.role)}</b><span class="chip">${this.esc(item.score ?? '—')}</span></div><p>${this.esc((item.reasons || []).join('; ') || label)}</p>${item.sourceUrl ? `<a href="${this.safeHref(item.sourceUrl)}" target="_blank" rel="noopener">View source ↗</a>` : ''}</article>`).join('')}</div></details>`;
+      return `<details ${outcome !== 'kept' ? 'open' : ''}><summary>${this.esc(label)} (${items.length})</summary><div class="scan-review-list">${items.map((item) => `<article class="scan-review-item"><div><b>${this.esc(item.company)} — ${this.esc(item.role)}</b><span class="chip">${this.esc(item.score ?? '—')}</span></div>${this.assessmentScoreDisclosure(item) ? `<p class="meta">${this.esc(this.assessmentScoreDisclosure(item))}</p>` : ''}<p>${this.esc((item.reasons || []).join('; ') || label)}</p>${item.sourceUrl ? `<a href="${this.safeHref(item.sourceUrl)}" target="_blank" rel="noopener">View source ↗</a>` : ''}</article>`).join('')}</div></details>`;
     }).join('');
     const coverageSources = (scan.coverage?.source || []).map((item) => (
       `<article class="scan-review-item"><div><b>${this.esc(item.value)}</b><span class="chip">${this.esc(item.assessed)} assessed</span></div><p>${this.esc(`${item.found} found · ${item.ranked} ranked · ${item.selected} selected · ${item.excluded} excluded`)}</p></article>`
@@ -1076,6 +1371,8 @@ const Scout = {
     const overlay = document.getElementById('scan-result-overlay');
     document.getElementById('scan-result-body').innerHTML = `
       <p><strong>${this.esc(scan.funnel?.assessed ?? scan.candidatesFound)} assessed, ${this.esc(scan.keepersAdded)} kept</strong>${this.discardBreakdown(scan) ? ` — ${this.esc(this.discardBreakdown(scan))}` : ''}.</p>
+      ${this.advertLivenessDisclosure(scan)}
+      ${scoreExplanation}
       ${scan.automaticBroadened ? '<div class="setup-callout"><strong>Discovery widened automatically</strong><p>Scout ran one broader query pass but kept every approved salary, location, commute, exclusion and evidence gate.</p></div>' : ''}
       ${coverage}
       ${coverageDimensions}
@@ -1215,19 +1512,20 @@ const Scout = {
     let r;
     try { r = await this.api(`/api/source?id=${encodeURIComponent(id)}`); }
     catch { r = { ok: false, error: 'request failed' }; }
-    body.dataset.loaded = '1';
-    body.innerHTML = this.sourceBodyHtml(r);
+    if (r?.ok === true) body.dataset.loaded = '1';
+    const entry = (this.state.data?.opportunities || []).find((e) => e.id === id);
+    body.innerHTML = this.sourceBodyHtml(r, entry);
   },
 
-  sourceBodyHtml(r) {
-    const fallback = `<div class="meta">couldn't read this page - open the source instead`;
+  sourceBodyHtml(r, entry) {
+    const fallback = `<div class="meta">Scout couldn't read the saved source. A blocked or failed link does not prove the vacancy is closed`;
     if (!r || typeof r !== 'object' || r.ok !== true) {
       const reason = r && r.error ? ` (${this.esc(r.error)})` : '';
-      return `${fallback}${reason}</div>`;
+      return `${fallback}${reason}. Try opening a saved source in your browser or search for the job elsewhere.</div>${this.sourceRecoveryHtml(entry)}`;
     }
     let host = '';
     try { host = new URL(r.url).hostname; } catch { /* leave blank */ }
-    const stamp = `<div class="meta">fetched ${this.esc(new Date(r.fetchedAt).toLocaleTimeString())}${host ? ` from ${this.esc(host)}` : ''}</div>`;
+    const stamp = `<div class="meta">fetched ${this.esc(new Date(r.fetchedAt).toLocaleTimeString())}${host ? ` from ${this.esc(host)}` : ''}${r.fallbackUsed ? ' — used a saved alternative source' : ''}</div>`;
     const factLabels = {
       title: 'title', salary: 'salary', location: 'location',
       employmentType: 'type', workMode: 'work mode',
@@ -1244,12 +1542,38 @@ const Scout = {
       + thin + text;
   },
 
+  advertFactsHtml(e) {
+    if (e.opportunityKind === 'employer-prospect') return '<div class="label">Employer prospect</div><p class="meta">A research lead: no vacancy, salary or working arrangement is confirmed. Review the official source and check the employer’s enquiry policy before contacting them.</p>';
+    const f = e.advertFacts || {};
+    const unknown = 'Not stated in the available source';
+    const c = f.compensation;
+    const amount = (n) => typeof n === 'number' && Number.isFinite(n) ? n.toLocaleString('en-GB') : null;
+    const low = amount(c?.minimum), high = amount(c?.maximum);
+    const range = low && high && low !== high ? `${low}–${high}` : low || high;
+    const salary = range ? `${c.currency || 'Currency unknown'} ${range}${c.period && c.period !== 'unknown' ? ` / ${c.period}` : ' (period unknown)'}${c.certainty === 'estimated' ? ' — estimated by source' : c.certainty === 'unknown' ? ' — certainty unknown' : ''}` : unknown;
+    const row = (label, text) => `<div class="meta"><b>${this.esc(label)}</b> ${this.esc(text)}</div>`;
+    const factsSource = this.safeHref(f.sourceUrl);
+    return '<div class="label">Advert facts and checks</div>'
+      + row('Salary', salary)
+      + row('Working pattern', f.workingPattern || unknown)
+      + row('Office days', Number.isInteger(f.officeDays) ? `${f.officeDays} per week stated` : unknown)
+      + row('Contract', f.employmentType || unknown)
+      + row('Hours', f.hours || unknown)
+      + row('Take-home pay', 'Needs an individual check; a gross salary does not confirm net pay')
+      + row('Evidence date', f.checkedAt || 'No saved source facts yet')
+      + row('Advert availability', f.availability === 'live' ? 'Verified open at the recorded check' : f.availability === 'gone' ? 'Reported closed — review source' : 'Current availability not verified')
+      + (factsSource ? `<div class="meta"><a href="${factsSource}" target="_blank" rel="noopener">Saved facts source</a></div>` : '')
+      + '<p class="meta">Missing facts are unknown, not passes. Hybrid alone does not confirm office days. Check the office address and door-to-door route separately.</p>'
+      + '<button class="act" data-action="restore-advert-facts">Restore facts from saved scans</button>';
+  },
+
   detailHtml(e) {
     const bd = e.scoreBreakdown || {};
     const bars = ['technical', 'sector', 'upside', 'comp', 'location', 'acceleration', 'credibility']
       .filter((k) => k in bd)
       .map((k) => `<div class="meta">${k} <span style="width:${(bd[k] || 0) * 6}px"></span> ${bd[k]}</div>`)
       .join('');
+    const assessmentScore = this.assessmentScoreDisclosure(e);
     const tags = (e.tags || []).length
       ? `<div class="chip-list">${(e.tags || []).map((t) => `<span class="chip">${this.esc(t)}</span>`).join('')}</div>`
       : '';
@@ -1277,21 +1601,22 @@ const Scout = {
     const hasOutreach = (cvFiles.outreach || []).includes(slug);
     const applied = ['applied', 'interviewing', 'accepted'].includes(e.status);
     const prepRecommended = this.interviewPrepRecommended(e.id);
-    const extraSources = (e.sources || []).slice(1)
-      .map((s) => this.safeHref(s)).filter(Boolean)
-      .map((href, i) => `<a href="${href}" target="_blank" rel="noopener">source ${i + 2}</a>`)
+    const extraSources = [...new Set((e.sources || []).map((s) => this.safeHref(s)).filter(Boolean))]
+      .map((href, i) => `<a href="${href}" target="_blank" rel="noopener noreferrer">saved source ${i + 1}</a>`)
       .join(' - ');
-    const sourcePanel = this.primarySource(e)
+    const sourcePanel = this.primarySource(e) || this.sourceRecoveryHtml(e)
       ? `<div class="label">source</div>
          <div class="source-panel">
            <button class="act" data-action="toggle-source" data-id="${this.esc(e.id)}">show what the source says</button>
            ${extraSources ? `<span class="meta"> ${extraSources}</span>` : ''}
+           ${this.sourceRecoveryHtml(e)}
            <div class="source-body" style="display:none"></div>
          </div>`
       : '';
     return `
+      ${this.advertFactsHtml(e)}
       ${sourcePanel}
-      <div class="label">score breakdown (read-only)</div>${bars || '<div class="meta">not scored yet</div>'}
+      <div class="label">score breakdown (read-only)</div>${assessmentScore ? `<div class="meta">${this.esc(assessmentScore)}. Assessment band markers are not percentage fit scores.</div>` : ''}${bars || '<div class="meta">not scored yet</div>'}
       <div class="label">tags</div>${tags || '<div class="meta">-</div>'}
       <div class="label">category</div><div class="meta">${this.esc(this.categoryOf(e))}</div>
       <div class="label">commute</div>${commuteHtml}
@@ -1312,6 +1637,7 @@ const Scout = {
         <button class="act" data-action="open-company-history" data-id="${this.esc(e.id)}">company history</button>
         <button class="act" data-action="record-feedback" data-id="${this.esc(e.id)}">record feedback</button>
         <button class="act bridge" data-action="open-chat" data-id="${this.esc(e.id)}" data-prefill="fit">fit and evidence gaps</button>
+        <button class="act bridge" data-action="open-chat" data-id="${this.esc(e.id)}" data-prefill="applicationApproach">research my application approach</button>
         <button class="act bridge" data-action="open-chat" data-id="${this.esc(e.id)}" data-prefill="ask">ask about this job</button>
         <button class="act${prepRecommended ? ' bridge' : ''}" data-action="open-interview-prep" data-id="${this.esc(e.id)}">interview prep</button>
       </div>`;
@@ -1360,6 +1686,7 @@ const Scout = {
     const trackerMutation = new Set([
       '/api/status', '/api/note', '/api/log', '/api/contact', '/api/category',
       '/api/commute', '/api/applied', '/api/rejected', '/api/stage', '/api/stage/complete',
+      '/api/speculative', '/api/advert-facts/restore',
     ]).has(pathname);
     const requestPayload = trackerMutation
       ? { ...payload, trackerRevision: this.state.data?.trackerRevision }
@@ -2036,10 +2363,11 @@ const Scout = {
       prefills: r.prefills || {},
       purpose: r.purpose || purpose,
       artifact: r.artifact || null,
+      applicationApproach: r.applicationApproach || null,
       streaming: !!r.busy,
       recovering: !!r.busy,
       pollTimer: null,
-      mode: prefillKey === 'fit' ? 'fit-assessment' : null,
+      mode: prefillKey === 'fit' ? 'fit-assessment' : prefillKey === 'applicationApproach' ? 'application-approach' : null,
     };
     this.chat = c;
     this.enginePicks = {};
@@ -2095,6 +2423,7 @@ const Scout = {
     c.engine = r.chat ? r.chat.engine : c.engine;
     c.prefills = r.prefills || c.prefills;
     c.artifact = r.artifact || c.artifact;
+    c.applicationApproach = r.applicationApproach || c.applicationApproach;
     c.streaming = false;
     c.recovering = false;
     this.renderChatDrawer();
@@ -2141,6 +2470,11 @@ const Scout = {
       </div>
       <div class="chat-companion">${scoutMarkup(c.streaming ? 'thinking' : 'listening')}<div class="scout-bubble tail-left"><span id="scout-chat-status">${c.streaming ? 'I’m thinking…' : prep ? 'Build your prep pack, refresh research, or practise here.' : 'Ask me anything about this opportunity.'}</span></div></div>
       ${prepControls}
+      ${!prep && (c.mode === 'application-approach' || c.applicationApproach?.exists) ? `<div class="controls" style="padding:8px 12px;flex-wrap:wrap">
+        <button class="act bridge" data-action="use-approach-prompt" data-prompt="applicationApproach">research / refresh plan</button>
+        ${c.applicationApproach?.exists ? '<button class="act" data-action="use-approach-prompt" data-prompt="approachDraft">draft a chosen idea</button>' : ''}
+        <span class="meta">Choose an engine and send the request when ready. Research creates a plan; nothing is sent to employers.</span>
+      </div>` : ''}
       <div id="chat-body" class="chat-body">${c.engine ? '' : picker}</div>
       <div class="chat-foot" ${c.engine ? '' : 'style="display:none"'}>
         <textarea id="chat-input" placeholder="message ${this.esc(c.engine || '')} - Enter sends, Shift+Enter for a new line" data-keydown-action="chat-key"></textarea>
@@ -2518,6 +2852,7 @@ const Scout = {
     body.innerHTML = this.chat.data.messages.map((m) => this.chatBubble(m.role, m.text)).join('')
       + this.cvLinkHtml()
       + this.interviewPrepPackHtml()
+      + this.applicationApproachHtml()
       + (this.chat.engine ? '' : this.chatPickerHtml());
     body.scrollTop = body.scrollHeight;
   },
@@ -2548,6 +2883,39 @@ const Scout = {
     }
     const updated = artifact.updatedAt ? ` - updated ${this.esc(new Date(artifact.updatedAt).toLocaleString())}` : '';
     return `<div class="chat-msg system"><details><summary>View prep pack${updated}</summary><pre style="white-space:pre-wrap">${this.esc(artifact.content || '')}</pre></details></div>`;
+  },
+
+  applicationApproachHtml() {
+    if (this.chat?.purpose !== 'job') return '';
+    const plan = this.chat.applicationApproach;
+    if (plan?.error) return `<div class="chat-msg system">${this.esc(plan.error)}</div>`;
+    if (!plan?.exists) return this.chat.mode === 'application-approach'
+      ? '<div class="chat-msg system">No application plan saved yet. Send the research request to generate one. Creating materials requires your separate choice.</div>' : '';
+    const updated = plan.updatedAt ? ` — updated ${this.esc(new Date(plan.updatedAt).toLocaleString())}` : '';
+    return `<div class="chat-msg system"><details><summary>View application plan${updated}</summary><pre style="white-space:pre-wrap">${this.esc(plan.content || '')}</pre>${this.approachSourceLinksHtml(plan.content)}</details></div>`;
+  },
+
+  approachSourceLinksHtml(content) {
+    const urls = new Set();
+    for (const raw of String(content || '').match(/https?:\/\/[^\s<>"\])]+/g) || []) {
+      try {
+        const url = new URL(raw.replace(/[.,;]+$/, ''));
+        if (url.username || url.password || url.href.length > 2000) continue;
+        urls.add(url.href);
+        if (urls.size >= 12) break;
+      } catch { /* an incomplete citation remains visible in the plan text */ }
+    }
+    return urls.size ? `<div class="meta">Links in this plan: ${[...urls].map((url, i) => `<a href="${this.safeHref(url)}" target="_blank" rel="noopener noreferrer">source ${i + 1}</a>`).join(' · ')}</div>` : '';
+  },
+
+  useApproachPrompt(key) {
+    const c = this.chat;
+    if (!c || c.purpose !== 'job' || c.streaming || !['applicationApproach', 'approachDraft'].includes(key)) return;
+    const input = document.getElementById('chat-input');
+    if (!input) return;
+    c.mode = key === 'applicationApproach' ? 'application-approach' : null;
+    input.value = c.prefills[key] || '';
+    input.focus();
   },
 
   usePrepPrompt(key) {
@@ -2674,6 +3042,7 @@ const Scout = {
           );
           c.data.cliSessionId = data.sessionId;
           if (data.filesTouched) c.data.filesTouched = data.filesTouched;
+          if (data.applicationApproach) c.applicationApproach = data.applicationApproach;
         }
         if (event === 'error') {
           this.setChatScoutState('warning', 'I hit a problem, but your completed work is safe.');
@@ -2945,6 +3314,9 @@ const Scout = {
       case 'close-scan-result': return this.closeScanResult();
       case 'complete-stage': return this.completeStage(id, Number(index));
       case 'toggle-source': return this.toggleSourcePanel(id, element);
+      case 'toggle-prospect-form': return this.toggleProspectForm();
+      case 'save-prospect': return this.saveProspect();
+      case 'restore-advert-facts': return this.restoreAdvertFacts();
       case 'mark-applied': return this.markApplied(id);
       case 'mark-accepted': return this.markAccepted(id);
       case 'mark-rejected': return this.rejectOpportunity(id);
@@ -2969,6 +3341,7 @@ const Scout = {
       case 'run-cv-quality-review': return this.runCvQualityReview();
       case 'review-evidence-for-master': return this.reviewEvidenceForMaster();
       case 'use-prep-prompt': return this.usePrepPrompt(prompt);
+      case 'use-approach-prompt': return this.useApproachPrompt(prompt);
       case 'handoff-chat': return this.handoffChat();
       case 'open-codex-task': return this.openCodexTask();
       case 'copy-codex-task': return this.copyCodexTask();
@@ -3026,14 +3399,29 @@ const Scout = {
       else if (element.dataset.engineModel) this.onEngineModelChange(element);
     });
     document.addEventListener?.('input', (event) => {
-      if (event.target.dataset.inputAction !== 'cv-dirty') return;
+      if (event.target.id === 'job-import-url') {
+        this.jobImportDraft = event.target.value;
+        this.saveJobImportState();
+        return;
+      }
+      if (event.target.id === 'job-import-advert') {
+        this.jobImportPastedAdvert = event.target.value;
+        this.saveJobImportState();
+        return;
+      }
+      if (event.target.dataset?.inputAction !== 'cv-dirty') return;
       this.cvState.dirty = true;
       this.cvState.content = event.target.value;
       const dirty = document.getElementById('cv-dirty');
       if (dirty) dirty.textContent = 'unsaved';
     });
     document.addEventListener?.('submit', (event) => {
-      if (event.target.dataset.submitAction !== 'save-company-communication') return;
+      const submitAction = event.target.dataset?.submitAction;
+      if (submitAction === 'job-import') {
+        event.preventDefault();
+        return this.importJobFromUrl();
+      }
+      if (submitAction !== 'save-company-communication') return;
       event.preventDefault();
       this.saveCompanyCommunication();
     });
@@ -3137,6 +3525,7 @@ const Scout = {
       initialFocus: '#scan-result-title', onEscape: () => this.closeScanResult(),
     });
     this.registerServiceWorker();
+    this.restoreJobImportState();
     window.addEventListener?.('offline', () => this.setHostAvailable(false));
     window.addEventListener?.('online', () => this.loadOpportunities().catch(() => this.setHostAvailable(false)));
     document.querySelectorAll('nav button').forEach((b) =>
@@ -3162,6 +3551,7 @@ const Scout = {
       }
     });
     this.loadOpportunities();
+    if (this.jobImportOperationId) this.watchJobImport(this.jobImportOperationId);
     this.reattachScanOperation();
     this.refreshSyncStatus();
     this.checkUiBuild();

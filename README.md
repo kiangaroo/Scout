@@ -21,6 +21,7 @@ Scout `0.1.x` is a cross-platform public beta. Windows SmartScreen and macOS Gat
 - Builds searches from the CV and preferences you explicitly approve; it does not inspect unrelated AI conversations or provider history.
 - Searches configured ATS boards and public sources. Adzuna is optional.
 - Tracks evidence, verdicts, follow-ups, applications, and dated reports in a private local Git repository.
+- Keeps researched employer prospects in Speculative, separately from advertised jobs, with a manual add flow and no invented vacancy or fit score.
 - Keeps real recruiter correspondence, calls, contacts and related vacancies together in a company relationship history while leaving each AI job chat role-specific.
 - Optionally backs that workspace up to a private GitHub repository and restores it on another computer; local-only use remains the default.
 - Optionally hosts that same running workspace and its Scout chats privately to the owner's phone or laptop through Tailscale Serve.

@@ -46,6 +46,34 @@ test('fetchAdzuna normalises jobs, locale/currency, and per-query counts', async
   assert.deepEqual(result.sources, { 'product designer': 1 });
 });
 
+test('fetchAdzuna labels predicted salaries as estimates without assuming tax treatment', async () => {
+  const predicted = await fetchAdzuna({ ...creds, queries: ['designer'] }, async () => response({ results: [
+    { ...item, salary_is_predicted: 1 },
+  ] }));
+  assert.equal(predicted.jobs[0].salary, '£60,000-£70,000 (estimated)');
+  assert.equal(predicted.jobs[0].salaryCertainty, 'estimated');
+});
+
+test('fetchAdzuna marks explicit Adzuna salary bounds as exact or range', async () => {
+  const result = await fetchAdzuna({ ...creds, queries: ['designer'] }, async () => response({ results: [
+    { ...item, id: 'range', salary_is_predicted: 0 },
+    { ...item, id: 'exact', salary_min: 65000, salary_max: 65000, salary_is_predicted: false },
+  ] }));
+  assert.equal(result.jobs[0].salaryCertainty, 'range');
+  assert.equal(result.jobs[1].salaryCertainty, 'exact');
+});
+
+test('fetchAdzuna leaves salary certainty unknown when prediction flag is absent or invalid', async () => {
+  const result = await fetchAdzuna({ ...creds, queries: ['designer'] }, async () => response({ results: [
+    { ...item, id: 'absent' },
+    { ...item, id: 'invalid', salary_is_predicted: 'maybe' },
+    { ...item, id: 'missing-bounds', salary_min: null, salary_max: null, salary_is_predicted: 0 },
+  ] }));
+  assert.equal(result.jobs[0].salaryCertainty, 'unknown');
+  assert.equal(result.jobs[1].salaryCertainty, 'unknown');
+  assert.equal(result.jobs[2].salaryCertainty, 'unknown');
+});
+
 test('fetchAdzuna dedupes and fails soft per query', async () => {
   let call = 0;
   const result = await fetchAdzuna({ ...creds, queries: ['bad', 'good', 'again'] }, async () => {

@@ -6,6 +6,8 @@ This file contains public architecture only. Private hostnames, account identiti
 
 ## System map
 
+Source previews fetch at most three saved HTTP(S) links sequentially through the existing public-resource safety boundary, with the existing per-request timeout, redirect and response-size limits. Cache identity includes the saved URL list. Failed sources do not establish vacancy closure. Employer/title search links are user-triggered browser navigation only; search results never overwrite tracker facts or establish live availability.
+
 | System | Purpose | Authority |
 | --- | --- | --- |
 | Public Scout application repository | UI, server, providers, installers, templates, tests, public documentation, and release workflow | Authoritative for application code |
@@ -36,13 +38,19 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   a compatible durable queue request; idle startup drains older compatible work
   before beginning new unqueued work, and interrupted claims resume under their
   original run identity.
+  Short non-scan workspace operations are retried for a bounded interval instead
+  of creating scan requests that those operations cannot drain. If the workspace
+  stays busy, the request ends with an explicit workspace-busy result.
 - Recovery selects the newest run compatible with the requested mode, purpose,
   published profile, source/config fingerprint and versioned stage inputs. It
   records why newer incomplete candidates were skipped. Deterministic stages
   are reused only when their inputs match; assessment reuse additionally binds
   provider, model, prompt and schema provenance. Incompatible candidates become
   immutable partial or abandoned evidence. A provider change is explicit and
-  creates new assessment provenance.
+  creates new assessment provenance. A failed finalisation remains recoverable
+  when it has a journal-authorised, unreceipted prepared mutation whose target
+  files still match the prepared identities; recovery resumes that mutation
+  under the successor fence and stops for review on any conflict.
 - The durable queue is an append-only journal. Manual requests expire after 24
   hours; scheduled requests expire at the next logical window or 12 hours,
   whichever comes first. Equivalent work deduplicates, scheduled equivalents
@@ -117,6 +125,12 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   deterministic exclusions remain trusted-runtime decisions. Each committed
   assessment binds provider, model, prompt, assessment-schema, profile and
   pipeline provenance.
+  Detailed recommendations map to configured Action/Check band markers, with
+  mandatory requirements retaining their veto and uncertainty caps. Sparse
+  discovery relevance remains separately labelled. A pipeline-version change
+  prevents an old prepared finalisation from being resumed as the new scoring
+  behaviour; earlier below-threshold decisions can be reassessed without
+  deleting their history or reopening explicit discard decisions.
   Valid job results are committed independently; invalid jobs receive one
   focused schema repair and one clean per-job retry. Recovery never resubmits
   completed jobs or batches. Durable request records contain only stable job
@@ -218,6 +232,18 @@ Pushing or merging a branch does not by itself update the live VPS.
 
 ## Maintenance contract
 
+Completed-workspace setup routing separates provider availability from saved profile readiness. A provider-only failure must not auto-open proposal generation or reinterpret an approved published profile as missing. Actual missing evidence/approval and active proposal recovery retain their existing guards.
+
+Manual vacancy import accepts one public listing URL and uses the existing public-resource boundary, bounded structured provider calls and assessment bands. Pasted advert text is an explicit fallback, not verified live content. Imported records use normal vacancy tools; manual selection never overrides profile evidence or mandatory-requirement uncertainty. Duplicate detection precedes publication, preserves existing history, and publication uses shared tracker mutation authority and backup. No automatic outreach or application follows import.
+
+Application research retries brief workspace contention only before a provider turn is created, under a bounded wait with cancellation and shutdown tracking. No foreign lease is cleared and no started provider turn is retried. The research prompt contains bounded profile/CV/config evidence plus the selected opportunity, and forbids broad tracker/cache dumps. Existing provider output-size limits remain in force.
+
+Application-approach research uses the ordinary job transcript with an explicit per-turn mode. Opening the button only prepares a prompt. Codex research requests live search with a read-only sandbox and excludes user configuration/rules; Claude research exposes only read and public-web tools, with strict MCP configuration and hooks disabled. Other chat turns retain their existing permissions. Research output is bounded to 100,000 UTF-8 bytes and atomically saved by Scout while workspace mutation authority is held, at `applications/<opportunity-id>/application-approach.md`. Paths reject symlink components; failures preserve the existing plan. A read error leaves normal job chat usable. Plans are private workspace application material covered by the existing backup path, not public application code. Provider research permissions and employer policies can limit what is verified; no automatic outreach or material creation follows research.
+
+Scans retain bounded structured advert facts through canonical tracker mutation recipes, without full advert bodies or raw provider responses. Older jobs can recover known facts from at most the latest 20 retained scan journals through the revision-checked tracker mutation route. Cached restoration fills missing facts, preserves decisions and known facts, and never counts as a fresh availability check. Unreadable evidence is skipped; an oversized evidence set fails explicitly.
+
+Speculative entries are explicit employer prospects created under the same revision and mutation fence as tracker edits. They have no invented vacancy or score. Saving one neither sends outreach nor enables monitoring; monitoring remains separate owner-reviewed registry configuration.
+
 Critical mutable workspace records are replaced atomically. Scout writes new contents to a temporary file in the same directory, flushes that file, and then renames it over the canonical path. This covers configuration, tracker state, chats, company timelines, CV-quality records, onboarding state, scan artifacts, recovery metadata, and imported CV text. Code that adds another critical workspace write must use the shared atomic-write helper; temporary files are never a source of truth.
 
 Multi-file onboarding activation additionally writes a prepared intent before
@@ -225,7 +251,10 @@ the first replacement and reconciles it at startup under the shared workspace
 mutation authority. Proposal staging and discard cannot erase that intent;
 conflicting post-crash bytes are preserved for review, and terminal marker
 cleanup is idempotent. Setup approval is valid only while every activated file
-matches the marker hash. Shutdown and restart synchronously gate HTTP, chat,
+matches the marker hash, except for a verified search-profile publication's
+configuration reference and mutation metadata. That exception requires an intact
+staged configuration baseline, a valid published profile and unchanged approved
+career evidence. Shutdown and restart synchronously gate HTTP, chat,
 operation and startup-recovery admission, cancel managed child processes, await
 admitted handlers and settle checkpoint producers, then drain acknowledged
 backup batches and provider-health probes before process handoff. A failed

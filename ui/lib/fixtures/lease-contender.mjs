@@ -56,6 +56,13 @@ if (command === 'race-acquire') {
     timing(duration, margin, guardTimeout),
   );
   write({ acquired: Boolean(lease), lease });
+} else if (command === 'wait-acquire') {
+  const [ready, gate, runId, duration, margin] = args;
+  const owner = currentLeaseOwner();
+  fs.writeFileSync(ready, JSON.stringify({ pid: process.pid }), 'utf8');
+  await waitFor(gate);
+  const lease = acquireScanLease(root, owner, operation(runId), timing(duration, margin));
+  write({ acquired: Boolean(lease), lease });
 } else if (command === 'heartbeat-owner') {
   const [ready, runId, duration, interval, margin] = args;
   const options = timing(duration, margin);

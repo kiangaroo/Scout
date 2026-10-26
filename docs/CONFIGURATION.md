@@ -43,7 +43,7 @@ scout doctor
 - `profile.tone` guides drafts; it never authorises sending.
 - Search arrays contain user-defined plain-text preferences. `salaryMinimum` is numeric or `null`; adverts with missing salary remain uncertain rather than passing automatically.
 - `commute.mode` records the user's policy; `maxMinutes` is the allowed journey time and `includeUnknown` controls whether unverified journeys remain visible.
-- `ai.provider` is `codex`, `claude` or `null`. `ai.models` provides optional per-provider choices for job-specific questions, CV tailoring and interview preparation; leave a value null to use the provider's current supported default. `ai.model` is retained as a compatibility fallback for older workspaces. Explicit model identifiers may contain letters, digits, `.`, `_`, `:`, or `-` only.
+- `ai.provider` is `codex`, `claude` or `null`. `ai.models` provides optional per-provider choices for manual scans, job-specific questions, CV tailoring and interview preparation; leave a value null to use the provider's current supported default. `ai.model` is retained as a compatibility fallback for older workspaces. A manual scan with no model override uses the selected provider's saved choice; an explicit null override selects the provider default. Explicit model identifiers may contain letters, digits, `.`, `_`, `:`, or `-` only.
 - Schedule job IDs use lower-case letters, numbers and hyphens. Time uses 24-hour `HH:MM`; `days` lists the weekdays the job runs on with Sunday as `0` (omit it or use an empty array for every day); provider is `codex` or `claude`; mode is `primary` or `second-pass`; and `model` is an optional per-scan override. Every enabled provider must be installed and authenticated on the host.
 - `setup.completedAt` is written by Scout when onboarding finishes. It prevents the first-run wizard reopening; use Settings to retune an existing workspace.
 
@@ -64,6 +64,11 @@ contributing profile fields and run history. Unchanged fields retain their lane
 history; removed fields are archived instead of remaining as hidden search
 preferences. Once this plan exists, query sources use only its selected active
 lanes. Legacy categories are not silently added.
+
+Publishing keeps onboarding approval valid when the published profile passes
+integrity checks and the remaining configuration still matches the reviewed
+staged baseline. Changes to approved career files or unrelated configuration
+still invalidate approval and require review.
 
 Settings shows the universal structured questions before at most six
 specialist follow-ups. Only checked answers change the complete draft, and no

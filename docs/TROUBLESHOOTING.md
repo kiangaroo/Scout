@@ -45,6 +45,23 @@ assessed counts. Do not infer that every found vacancy was sent to the provider.
 If the displayed total and source funnels do not reconcile, preserve the run
 record and stop; schema-v5 writers fail closed rather than publishing that state.
 
+Discovery relevance measures how much source text matches the published search
+profile. Sparse descriptions and alternative titles can lower it; it is not a
+percentage estimate of suitability. Once a role receives detailed assessment,
+the Action/Check number is a labelled assessment-band marker. Review the
+mandatory checks and source advert before deciding whether to apply. Older
+below-threshold decisions from the previous scoring method may be reassessed;
+explicit discard and unmet-requirement decisions remain preserved.
+
+## Advert availability could not be verified
+
+An aggregator returning a vacancy does not prove that its individual advert is
+still open. Scout removes adverts confirmed closed, but a blocked page, timeout
+or other inconclusive response remains unverified. The latest scan and review
+show how many links could not be verified. Open the source advert before
+applying; neither an assessment band nor the date of Scout's review confirms
+current availability.
+
 ## Scheduled scan does not run
 
 Check `scout schedule status`, confirm the native scheduler entry points to the current application/workspace and run `scout schedule run-now`. Inspect workspace logs and Task Scheduler, launchd, or systemd-user history. Remove/reinstall the schedule after moving a workspace.
@@ -59,6 +76,17 @@ manual command shown in Settings. Claude credential clearing is offered only
 after a fresh expired-credential failure and always requires confirmation.
 
 ## Interrupted scan, recovery, or lost lease
+
+The durable scan card includes only validated scan runs; saving a search profile
+does not start a scan. An incomplete run without a current worker is paused, not
+actively collecting. Use **Scan now** to request recovery, and check that the
+card shows an active worker before waiting for progress. A persisted queue claim
+alone does not establish that a worker is still running.
+
+Scout briefly waits for a backup or other workspace update before starting a
+scan. If that update remains busy, Scout reports it explicitly without leaving
+a scan request queued behind an operation that cannot process it. Allow the
+workspace update to finish, then retry **Scan now**.
 
 After a process exit or machine restart, start Scout normally. It validates the
 append-only run journal, the rebuildable manifest, the persisted lease expiry

@@ -119,18 +119,25 @@ test('guard publication retries a transient Windows busy result within its exist
 test('an independent heartbeat prevents a competing process from taking over', async () => {
   const root = temp();
   const ready = path.join(root, 'heartbeat-ready');
-  const leaseDurationMs = 350;
-  const heartbeatIntervalMs = 40;
-  const takeoverMarginMs = 50;
+  const contenderReady = path.join(root, 'contender-ready');
+  const acquireGate = path.join(root, 'contender-acquire');
+  const leaseDurationMs = 2_000;
+  const heartbeatIntervalMs = 100;
+  const takeoverMarginMs = 250;
   const owner = child([
     'heartbeat-owner', root, ready, 'run-heartbeat',
     String(leaseDurationMs), String(heartbeatIntervalMs), String(takeoverMarginMs),
+  ]);
+  const contenderProcess = child([
+    'wait-acquire', root, contenderReady, acquireGate, 'run-contender',
+    String(leaseDurationMs), String(takeoverMarginMs),
   ]);
   let contender;
   let ownerResult;
   try {
     await waitUntil(() => fs.existsSync(ready), 'heartbeat owner did not acquire');
     const initial = JSON.parse(fs.readFileSync(ready, 'utf8'));
+    await waitUntil(() => fs.existsSync(contenderReady), 'contender did not warm its process identity');
     await waitUntil(() => {
       const current = readScanLease(root);
       return current?.leaseId === initial.leaseId
@@ -138,12 +145,15 @@ test('an independent heartbeat prevents a competing process from taking over', a
         && Date.now() >= Date.parse(initial.expiresAt) + takeoverMarginMs
         && Date.parse(current.expiresAt) - Date.now() >= leaseDurationMs / 2;
     }, 'heartbeat did not renew beyond the original takeover window');
-    contender = await child([
-      'acquire', root, 'run-contender', String(leaseDurationMs), String(takeoverMarginMs),
-    ]).result;
+    fs.writeFileSync(acquireGate, '', 'utf8');
+    contender = await contenderProcess.result;
   } finally {
+    if (!fs.existsSync(acquireGate)) fs.writeFileSync(acquireGate, '', 'utf8');
     owner.process.stdin.end('stop\n');
     ownerResult = await owner.result;
+    if (!contender) {
+      try { await contenderProcess.result; } catch { /* retain the original test failure */ }
+    }
   }
 
   assert.equal(contender.acquired, false);

@@ -15,9 +15,11 @@ export function buildCodexArgs(resumeId, options = {}) {
   const args = [
     'exec', '--json',
     '-c', `model_reasoning_effort="${reasoningEffort}"`,
-    '--sandbox', 'workspace-write',
+    '--sandbox', options.readOnlyResearch === true ? 'read-only' : 'workspace-write',
     '--skip-git-repo-check',
   ];
+  if (options.webSearch === true) args.unshift('--search');
+  if (options.readOnlyResearch === true) args.push('--ignore-user-config', '--ignore-rules');
   const platform = options.platform || process.platform;
   if (platform === 'win32') {
     const windowsSandbox = options.windowsSandbox || 'unelevated';

@@ -23,8 +23,91 @@ import {
   searchLanePlanHtml,
   searchProfileReviewHtml,
   splitList,
+  providerOnlyReadinessGap,
   validateCvName,
 } from './setup.js';
+
+test('provider-only readiness failure does not masquerade as an incomplete setup', () => {
+  const established = {
+    setupComplete: true,
+    established: true,
+    searchProfilePublished: true,
+    trackerExists: true,
+    readiness: { provider: false, preferences: true, evidence: true, approved: true, tracker: true },
+  };
+  assert.equal(providerOnlyReadinessGap(established), true);
+  assert.equal(providerOnlyReadinessGap({ ...established, established: false, readiness: { ...established.readiness, evidence: false } }), false);
+  assert.equal(providerOnlyReadinessGap({ ...established, setupComplete: false, established: false }), false);
+});
+
+async function refreshSetup(status, { proposal = null, proposalOperation = null } = {}) {
+  globalThis.window = globalThis.window || {};
+  await import('./setup.js?refresh-status-harness');
+  const Setup = globalThis.window.ScoutSetup;
+  const classes = new Set();
+  const elements = Object.fromEntries(['setup-overlay', 'setup-title', 'setup-subtitle', 'setup-progress', 'setup-body', 'setup-back', 'setup-skip', 'setup-next'].map((id) => [id, {
+    classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name) },
+    textContent: '', innerHTML: '',
+  }]));
+  const prior = { document: globalThis.document, fetch: globalThis.fetch, localStorage: globalThis.localStorage };
+  globalThis.document = { getElementById: (id) => elements[id] };
+  globalThis.localStorage = { getItem: () => null };
+  globalThis.fetch = async (url) => {
+    const body = url === '/api/setup/status' ? status
+      : url === '/api/setup/proposal' ? { proposal }
+        : url === '/api/operations?type=proposal' ? { operation: proposalOperation }
+          : { operation: null };
+    return { ok: true, json: async () => body };
+  };
+  try {
+    const view = Object.create(Setup);
+    view.status = null;
+    view.view = 'closed';
+    view.operations = { proposal: null, scan: null };
+    view.pendingRecoveryKey = null;
+    view.reattachOperations = async function reattach() {
+      const body = await (await fetch('/api/operations?type=proposal')).json();
+      this.operations.proposal = body.operation;
+      this.operations.scan = null;
+    };
+    view.render = () => {};
+    view.resumeSteps = [];
+    view.resumeAt = function resumeAt(step) { this.resumeSteps.push(step); this.step = step; };
+    view.setMessage = () => {};
+    view.el = (id) => elements[id];
+    await view.refreshStatus();
+    return { view, classes };
+  } finally {
+    if (prior.document === undefined) delete globalThis.document; else globalThis.document = prior.document;
+    if (prior.fetch === undefined) delete globalThis.fetch; else globalThis.fetch = prior.fetch;
+    if (prior.localStorage === undefined) delete globalThis.localStorage; else globalThis.localStorage = prior.localStorage;
+  }
+}
+
+test('setup refresh only resumes first-run work for real setup gaps or active proposals', async () => {
+  const providerOnly = {
+    setupComplete: true, established: true, ready: false, searchProfilePublished: true,
+    readiness: { provider: false, preferences: true, evidence: true, approved: true, tracker: true },
+    pendingSetupSections: [], config: {}, trackerExists: true,
+  };
+  const complete = await refreshSetup(providerOnly);
+  assert.deepEqual(complete.view.resumeSteps, []);
+  assert.equal(complete.view.view, 'closed');
+
+  const staged = await refreshSetup(providerOnly, { proposal: { proposalId: 'pending' } });
+  assert.deepEqual(staged.view.resumeSteps, []);
+  assert.equal(staged.view.view, 'closed');
+
+  const active = await refreshSetup(providerOnly, { proposalOperation: { status: 'running', id: 'proposal-1' } });
+  assert.deepEqual(active.view.resumeSteps, [5]);
+
+  const evidenceGap = await refreshSetup({ ...providerOnly, readiness: { ...providerOnly.readiness, evidence: false } });
+  assert.deepEqual(evidenceGap.view.resumeSteps, [5]);
+
+  const fresh = await refreshSetup({ setupComplete: false, established: false, ready: false, readiness: {}, pendingSetupSections: [], config: {}, trackerExists: false });
+  assert.deepEqual(fresh.view.resumeSteps, []);
+  assert.equal(fresh.view.view, 'onboarding');
+});
 
 test('feedback learning review separates job events, pending proposals and published undo', () => {
   const html = feedbackLearningHtml({

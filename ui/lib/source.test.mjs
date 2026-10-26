@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  htmlToText, extractJobFacts, buildSourcePayload, sourceUrlOf,
+  htmlToText, extractJobFacts, buildSourcePayload, sourceUrlOf, sourceUrlsOf, fetchEntrySource,
   SourceCache, THIN_TEXT_CHARS,
 } from './source.mjs';
 
@@ -107,6 +107,67 @@ test('sourceUrlOf returns the first http(s) source or null', () => {
   assert.equal(sourceUrlOf({ sources: [] }), null);
   assert.equal(sourceUrlOf({}), null);
   assert.equal(sourceUrlOf(null), null);
+});
+
+test('sourceUrlsOf returns unique safe saved sources, bounded to three', () => {
+  assert.deepEqual(sourceUrlsOf({ sources: [
+    'javascript:alert(1)', 'https://user:secret@unsafe.test/job', 'https://a.test/job',
+    'https://a.test/job', 'https://b.test/job', 'https://c.test/job', 'https://d.test/job',
+  ] }), ['https://a.test/job', 'https://b.test/job', 'https://c.test/job']);
+  assert.equal(sourceUrlOf({ sources: ['javascript:alert(1)', 'https://b.test/job'] }), 'https://b.test/job');
+});
+
+test('fetchEntrySource tries saved alternatives after HTTP failure and marks fallback success', async () => {
+  const attempted = [];
+  const result = await fetchEntrySource({ sources: ['https://adzuna.test/out', 'https://employer.test/job'] }, {
+    now: () => '2026-10-24T12:00:00.000Z',
+    fetchResource: async (url, options) => {
+      attempted.push({ url, options });
+      return url.includes('adzuna') ? { ok: false, status: 403 } : { ok: true, text: async () => '<p>Current job advert</p>' };
+    },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.url, 'https://employer.test/job');
+  assert.equal(result.payload.fallbackUsed, true);
+  assert.equal(attempted.length, 2);
+  assert.deepEqual(attempted[0].options, {
+    timeoutMs: 10000, maxBytes: 1_000_000, maxRedirects: 4,
+    allowedContentTypes: ['text/html', 'application/xhtml+xml', 'application/xml', 'text/plain'],
+    headers: {
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    },
+  });
+});
+
+test('fetchEntrySource preserves the first failure and never attempts more than three saved URLs', async () => {
+  const attempted = [];
+  const result = await fetchEntrySource({ sources: [
+    'https://a.test/1', 'https://b.test/2', 'https://c.test/3', 'https://d.test/4',
+  ] }, {
+    fetchResource: async (url) => {
+      attempted.push(url);
+      if (url.includes('a.test')) throw Object.assign(new Error('blocked'), { reasonCode: 'unsafe-destination' });
+      throw new Error('network down');
+    },
+  });
+  assert.equal(attempted.length, 3);
+  assert.deepEqual(result, {
+    status: 502,
+    payload: { ok: false, error: 'Source could not be fetched.', reasonCode: 'unsafe-destination' },
+  });
+});
+
+test('fetchEntrySource keeps timeout and HTTP response failures distinct', async () => {
+  const timedOut = await fetchEntrySource({ sources: ['https://a.test/1'] }, {
+    fetchResource: async () => { throw Object.assign(new Error('timeout'), { reasonCode: 'request-timeout' }); },
+  });
+  const rejected = await fetchEntrySource({ sources: ['https://a.test/1'] }, {
+    fetchResource: async () => ({ ok: false, status: 403 }),
+  });
+  assert.equal(timedOut.payload.reasonCode, 'source-timeout');
+  assert.equal(timedOut.payload.error, 'Source request timed out.');
+  assert.deepEqual(rejected.payload, { ok: false, error: 'source returned 403' });
 });
 
 test('SourceCache expires entries after the TTL', () => {

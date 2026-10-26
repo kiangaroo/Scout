@@ -250,7 +250,6 @@ export function publicQueueSummary(projection = {}) {
       expiresAt: typeof request.expiresAt === 'string' ? request.expiresAt : null,
     };
     if (request.claim?.runId) item.runId = shortId(request.claim.runId);
-    if (request.claim?.owner) item.owner = 'active worker';
     return item;
   });
   return {
@@ -270,7 +269,9 @@ export function readPublicRunSummaries(root, { lease = null, now = new Date() } 
     if (!fs.existsSync(journalFile)) continue;
     try {
       const { events } = validateRunJournal(journalFile);
-      if (!events.length) continue;
+      // Profile publication also uses the durable run journal for mutation
+      // recovery. Only a validated scan start establishes scan evidence.
+      if (!events.some((event) => event.type === 'run.started')) continue;
       runs.push(publicRunSummary(projectRunManifest(events), { events, lease, now }));
     } catch {
       runs.push({

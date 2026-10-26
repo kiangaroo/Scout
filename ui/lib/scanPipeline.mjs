@@ -17,7 +17,7 @@ import {
 } from './vacancyObservation.mjs';
 import { rankVacancies, vacancyNoveltyComparison } from './vacancyRank.mjs';
 import { selectVacancies } from './vacancySelect.mjs';
-import { partitionVacanciesForAssessment } from './vacancyLifecycle.mjs';
+import { decideVacancyLifecycle } from './vacancyLifecycle.mjs';
 import {
   buildCoverageRollups, buildVacancyExplanations, reconcileCoverageFunnel,
 } from './scanCoverage.mjs';
@@ -25,6 +25,7 @@ import {
   PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION, commitRunArtifact, projectRunManifest,
   readRunArtifact, validateManifestAgreement,
 } from './runArtifacts.mjs';
+import { advertFacts, mergeAdvertFacts, sanitizeAdvertFacts } from './advertFacts.mjs';
 import { appendRunEvent, openRunJournal, validateRunJournal } from './runJournal.mjs';
 import { recoverRun, selectRecoverableRun } from './runRecovery.mjs';
 import {
@@ -44,7 +45,8 @@ import {
 } from './assessmentBatches.mjs';
 import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
 import {
-  applyPreparedMutation, loadPreparedMutation, markerFreeMutationContent, prepareMutation,
+  applyPreparedMutation, loadPreparedMutation, loadRecoverablePreparedFinalisation,
+  markerFreeMutationContent, prepareMutation,
 } from './mutationCoordinator.mjs';
 import {
   jsonReplaceRecipe, renderMutationRecipe, runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe,
@@ -152,10 +154,12 @@ function pipelineRunCandidates(root, requestedRunId) {
       const run = openRunJournal(root, runId);
       if (!run.events.length) continue;
       const manifest = projectRunManifest(run.events);
+      const outcome = manifest.outcome === 'failed'
+        && loadRecoverablePreparedFinalisation(run) ? 'in-progress' : manifest.outcome;
       candidates.push({
         runId,
         updatedAt: run.events.at(-1).recordedAt,
-        outcome: manifest.outcome,
+        outcome,
         compatibility: manifest.compatibility,
         completedWork: manifest.completedWork,
       });
@@ -539,10 +543,12 @@ export async function runScanPipeline({
       leaseOptions,
   );
   let durableQueueSubmission = false;
+  let workspaceLeaseObserved = false;
   let queueCoveragePending = false;
   for (let attempt = 0; !lease && attempt < 64; attempt += 1) {
     const observed = readScanLease(root);
-    if (observed?.operation?.kind === 'provider-health') {
+    if (observed && observed.operation?.kind !== 'scan') {
+      workspaceLeaseObserved = true;
       const waitUntil = Date.parse(observed.expiresAt) + Number(observed.takeoverMarginMs || 0);
       const waitMs = Math.max(1, Math.min(250, waitUntil - Date.now()));
       await waitForTransientLease(waitMs);
@@ -578,13 +584,15 @@ export async function runScanPipeline({
     );
   }
   if (!lease) {
+    const busyWorkspace = workspaceLeaseObserved && !durableQueueSubmission;
     return resultWithOutputs({
       runId: provisionalRunId,
       outcome: durableQueueSubmission ? 'queued' : 'failed',
       manifest: null,
       failures: Object.freeze([{
-        code: durableQueueSubmission ? 'lease-busy' : 'queue-submit-raced',
+        code: durableQueueSubmission ? 'lease-busy' : busyWorkspace ? 'workspace-busy' : 'queue-submit-raced',
         stage: 'initialise',
+        ...(busyWorkspace ? { message: 'another workspace operation is in progress' } : {}),
       }]),
     }, new Map());
   }
@@ -1145,6 +1153,31 @@ function assessmentVacancy(vacancy) {
   void omittedObservations;
   const references = sourceReferences(vacancy);
   const url = vacancy?.canonicalUrl || observation.sourceUrl || references[0]?.url || '';
+  const fetchedAt = observations
+    .map((item) => String(item?.fetchedAt || ''))
+    .filter(Boolean)
+    .sort()
+    .at(-1) || observation.fetchedAt || null;
+  const description = observations
+    .map((item) => String(item?.description || '').slice(0, 12_000))
+    .join('\n')
+    .slice(0, 12_000);
+  const observedFacts = observations
+    .filter((item) => item?.advertFacts)
+    .sort((left, right) => String(left?.fetchedAt || '').localeCompare(String(right?.fetchedAt || '')))
+    .reduce((facts, item) => mergeAdvertFacts(facts, item.advertFacts), null);
+  const fallbackFacts = advertFacts({
+    url,
+    fetchedAt,
+    compensation: vacancy?.compensation,
+    workingPattern: vacancy?.workingPattern,
+    employmentType: vacancy?.employmentType,
+    description,
+  });
+  const retainedAdvertFacts = mergeAdvertFacts(
+    mergeAdvertFacts(sanitizeAdvertFacts(vacancy?.advertFacts), observedFacts),
+    fallbackFacts,
+  );
   return {
     ...canonicalVacancy,
     company: valueOf(vacancy?.employer) || '',
@@ -1153,6 +1186,7 @@ function assessmentVacancy(vacancy) {
     location: valueOf(vacancy?.location) || '',
     workingType: valueOf(vacancy?.workingPattern) || '',
     salary: valueOf(vacancy?.compensation) || null,
+    ...(retainedAdvertFacts ? { advertFacts: retainedAdvertFacts } : {}),
     postedDate: vacancy?.postedAt || null,
     source: observation.source || references[0]?.source || '',
     providerId: observation.sourceRecordId || references[0]?.providerId || '',
@@ -1256,6 +1290,11 @@ export function readVacancyDecisionHistory(root, { limit = VACANCY_DECISION_HIST
         contentFingerprint: /^[a-f0-9]{64}$/.test(String(item.contentFingerprint || ''))
           ? item.contentFingerprint
           : null,
+        ...(item.scoreBasis === 'assessment-band' ? { scoreBasis: 'assessment-band' } : {}),
+        ...(Number.isFinite(Number(item.discoveryScore))
+          && Number(item.discoveryScore) >= 0 && Number(item.discoveryScore) <= 100
+          ? { discoveryScore: Number(item.discoveryScore) }
+          : {}),
         profileId: boundedText(item.profileId || run.profile_id, 80),
         learningVersionId: boundedText(
           item.learningVersionId || run.learning_version_id || 'learning-baseline',
@@ -1278,6 +1317,24 @@ export function readVacancyDecisionHistory(root, { limit = VACANCY_DECISION_HIST
     ...reviewedRecords.slice(0, reviewedCount),
     ...preAssessmentRecords.slice(0, preAssessmentCount),
   ];
+}
+
+function partitionForAssessmentBasis(ranked, history, profileId) {
+  const eligible = [];
+  const skipped = [];
+  for (const vacancy of ranked || []) {
+    const previous = (history || []).find((item) => sameUnderlyingJob(item, vacancy)) || null;
+    const legacyAssessmentScore = previous?.outcome === 'below_threshold'
+      && previous.scoreBasis !== 'assessment-band';
+    const lifecycle = decideVacancyLifecycle(previous, vacancy, {
+      profileId,
+      assessmentChanged: legacyAssessmentScore,
+    });
+    const annotated = { ...vacancy, lifecycle };
+    if (lifecycle.skipAssessment) skipped.push(annotated);
+    else eligible.push(annotated);
+  }
+  return { eligible, skipped };
 }
 
 function observationInputs(sources) {
@@ -1334,7 +1391,7 @@ export function prepareRankedDiscovery({
   const discoveryCounts = laneDiscoveryCounts(vacancies, profile, reviewedHistory);
   const filtered = filterVacancies(vacancies, profile, { learningPolicy });
   const ranked = rankVacancies(filtered.eligible, profile, reviewedHistory, { learningPolicy });
-  const lifecycle = partitionVacanciesForAssessment(ranked, decisionHistory, { profileId: profile.id });
+  const lifecycle = partitionForAssessmentBasis(ranked, decisionHistory, profile.id);
   const configuredThreshold = Number(relevanceThreshold ?? profile?.selection?.relevanceThreshold ?? 1);
   const threshold = Number.isFinite(configuredThreshold) ? Math.max(Number.EPSILON, configuredThreshold) : 1;
   const selection = selectVacancies(lifecycle.eligible, {
@@ -1491,7 +1548,8 @@ function digestText(value) {
   return createHash('sha256').update(String(value || '')).digest('hex');
 }
 
-function semanticObservation(job, sourceName, source, profile, { durableUrls = true } = {}) {
+function semanticObservation(job, sourceName, source, profile, { durableUrls = true, fetchedAt = null } = {}) {
+  const observedAt = source?.fetchedAt || source?.generatedAt || fetchedAt || job?.fetchedAt || null;
   const observation = normaliseObservation(job, {
     sourceName: job?.source || sourceName,
     collectionSource: sourceName,
@@ -1547,6 +1605,14 @@ function semanticObservation(job, sourceName, source, profile, { durableUrls = t
     ...safeObservation
   } = observation;
   void omittedDescription;
+  const vacancyFacts = advertFacts({
+    url: observation.sourceUrl,
+    fetchedAt: observedAt || observation.fetchedAt,
+    compensation: observation.compensation,
+    workingPattern: observation.workingPattern,
+    employmentType: observation.employmentType,
+    description,
+  });
   return {
     ...safeObservation,
     sourceUrl: durableUrls ? privacySafeStageUrl(sourceUrl) : sourceUrl,
@@ -1558,6 +1624,7 @@ function semanticObservation(job, sourceName, source, profile, { durableUrls = t
       seniority: identity.seniority,
       evidenceTokenDigests: identity.evidenceTokens.map(digestText),
     },
+    ...(vacancyFacts ? { advertFacts: vacancyFacts } : {}),
     semanticEvidence: {
       descriptionPresent: Boolean(description.trim()),
       descriptionDigest,
@@ -1607,7 +1674,7 @@ function semanticCollectedSource(source, sourceName, profile, options = {}) {
   };
 }
 
-function legacySemanticJob(job, sourceName, { durableUrls = true } = {}) {
+function legacySemanticJob(job, sourceName, { durableUrls = true, fetchedAt = null } = {}) {
   const candidate = normaliseJob(job);
   if (!candidate) return null;
   const description = String(job?.description || '');
@@ -1616,6 +1683,21 @@ function legacySemanticJob(job, sourceName, { durableUrls = true } = {}) {
     candidate.url,
     candidate.urlIdentityDigest,
   );
+  const retainedAdvertFacts = advertFacts({
+    url: candidate.url,
+    fetchedAt: fetchedAt || job?.fetchedAt || null,
+    compensation: job?.compensation || {
+      minimum: job?.salaryMin,
+      maximum: job?.salaryMax,
+      currency: job?.salaryCurrency,
+      period: job?.salaryPeriod,
+      rateType: job?.salaryRateType || job?.compensationRateType || job?.rateType,
+      certainty: job?.salaryCertainty || job?.compensationCertainty,
+    },
+    workingPattern: job?.workingPattern || job?.workingType,
+    employmentType: job?.employmentType,
+    description,
+  });
   return {
     company: candidate.company,
     title: candidate.role,
@@ -1628,6 +1710,7 @@ function legacySemanticJob(job, sourceName, { durableUrls = true } = {}) {
     providerId: candidate.providerId,
     ...(urlIdentityDigest ? { urlIdentityDigest } : {}),
     ...(urlIdentityDigest ? { urlIdentityProvenance: 'durable-query-v1' } : {}),
+    ...(retainedAdvertFacts ? { advertFacts: retainedAdvertFacts } : {}),
     sourceReferences: candidate.sourceReferences.map((reference) => ({
       ...reference,
       url: durableUrls ? privacySafeStageUrl(reference.url) : reference.url,
@@ -1651,7 +1734,10 @@ function legacySemanticJob(job, sourceName, { durableUrls = true } = {}) {
 
 function legacySemanticCollectedSource(source, sourceName, options = {}) {
   const jobs = Array.isArray(source?.jobs) ? source.jobs : [];
-  const semanticJobs = jobs.map((job) => legacySemanticJob(job, sourceName, options)).filter(Boolean);
+  const semanticJobs = jobs.map((job) => legacySemanticJob(job, sourceName, {
+    ...options,
+    fetchedAt: source?.fetchedAt || source?.generatedAt || null,
+  })).filter(Boolean);
   return {
     configured: Boolean(source?.configured),
     status: ['healthy', 'degraded', 'unavailable'].includes(source?.status) ? source.status : 'unavailable',
@@ -1695,7 +1781,10 @@ function encodePipelineStageValue(stageId, value, profile = null, { durableUrls 
       .map(([source, result]) => [
         String(source).slice(0, 80),
         profile
-          ? semanticCollectedSource(result, source, profile, { durableUrls })
+          ? semanticCollectedSource(result, source, profile, {
+            durableUrls,
+            fetchedAt: value?.generatedAt || null,
+          })
           : legacySemanticCollectedSource(result, source, { durableUrls }),
       ])),
   };
@@ -1830,11 +1919,7 @@ export function createRankedDiscoveryStages({
     select: withRankedArtifactCodec('select', function selectStage({ run, priorArtifact }) {
       const configuredThreshold = Number(relevanceThreshold ?? profile?.selection?.relevanceThreshold ?? 1);
       const threshold = Number.isFinite(configuredThreshold) ? Math.max(Number.EPSILON, configuredThreshold) : 1;
-      const lifecycle = partitionVacanciesForAssessment(
-        priorArtifact.ranked,
-        decisionHistory,
-        { profileId: profile.id },
-      );
+      const lifecycle = partitionForAssessmentBasis(priorArtifact.ranked, decisionHistory, profile.id);
       const selection = selectVacancies(lifecycle.eligible, {
         limit,
         threshold,
@@ -1922,6 +2007,7 @@ export function inboxRecheckCandidates(tracker, incomingCandidates = []) {
   const missingSource = [];
   for (const entry of tracker?.opportunities || []) {
     if (entry.status !== 'new') continue;
+    if (isEmployerProspect(entry)) continue;
     if (incomingCandidates.some((candidate) => sameUnderlyingJob(entry, candidate))) continue;
     const url = (entry.sources || []).map(safeSourceUrl).find(Boolean);
     const candidate = { _inboxRecheck: true, _trackerId: entry.id, url };
@@ -1931,12 +2017,20 @@ export function inboxRecheckCandidates(tracker, incomingCandidates = []) {
   return { checkable, missingSource };
 }
 
-function archiveStaleInboxEntries(tracker, entries, date) {
+function isEmployerProspect(entry) {
+  return entry?.type === 'employer-prospect'
+    || entry?.opportunityKind === 'employer-prospect'
+    || (Array.isArray(entry?.tags) && entry.tags.some((tag) => (
+      String(tag || '').trim().toLowerCase() === 'speculative outreach'
+    )));
+}
+
+export function archiveStaleInboxEntries(tracker, entries, date) {
   const reasons = new Map(entries.map((item) => [item._trackerId, item.liveness?.reason || 'advert is no longer live']));
   let archived = 0;
   for (const entry of tracker.opportunities || []) {
     const reason = reasons.get(entry.id);
-    if (entry.status !== 'new' || !reason) continue;
+    if (entry.status !== 'new' || !reason || isEmployerProspect(entry)) continue;
     entry.status = 'ignore';
     entry.tags = [...new Set([...(entry.tags || []), 'Advert unavailable'])];
     const note = `[${date}] Removed from Jobs automatically: ${reason}.`;
@@ -2166,25 +2260,36 @@ export function validateAssessments(value, candidates) {
 export function gateAssessment(assessment, policy, candidate = {}) {
   const actionScore = Number(policy?.actionScore ?? 70);
   const checkScore = Number(policy?.checkScore ?? 55);
-  const rankedScore = Number(candidate?.preRankScore);
-  const total = Number.isFinite(rankedScore)
-    ? Math.round(rankedScore * 100) / 100
-    : assessment.recommendation === 'keep' ? actionScore
-      : assessment.recommendation === 'check' ? checkScore : 0;
+  const assessmentBand = assessment.recommendation === 'keep' ? actionScore
+    : assessment.recommendation === 'check' ? checkScore : 0;
+  const total = assessmentBand;
   const unmet = (assessment.mandatoryRequirements || []).filter((item) => item.status === 'unmet');
   const unknown = (assessment.mandatoryRequirements || []).filter((item) => item.status === 'unknown');
   if (assessment.recommendation === 'discard' || unmet.length) {
     return {
       eligibility: 'ineligible',
       score: Math.min(total, checkScore - 1),
+      assessmentBand,
       keep: false,
       reasons: unmet.map((item) => item.requirement),
     };
   }
   if (unknown.length || assessment.recommendation === 'check') {
-    return { eligibility: 'check', score: Math.min(total, actionScore - 1), keep: total >= checkScore, reasons: unknown.map((item) => item.requirement) };
+    return {
+      eligibility: 'check',
+      score: Math.min(total, actionScore - 1),
+      assessmentBand,
+      keep: total >= checkScore,
+      reasons: unknown.map((item) => item.requirement),
+    };
   }
-  return { eligibility: total >= actionScore ? 'eligible' : total >= checkScore ? 'check' : 'below-threshold', score: total, keep: total >= checkScore, reasons: [] };
+  return {
+    eligibility: total >= actionScore ? 'eligible' : total >= checkScore ? 'check' : 'below-threshold',
+    score: total,
+    assessmentBand,
+    keep: total >= checkScore,
+    reasons: [],
+  };
 }
 
 function sourceHealth(sources) {
@@ -2194,7 +2299,7 @@ function sourceHealth(sources) {
   }]));
 }
 
-function mergeTracker(
+export function mergeTracker(
   existing,
   candidates,
   assessments,
@@ -2234,7 +2339,11 @@ function mergeTracker(
       profileId: boundedText(profileId, 80),
       learningVersionId: boundedText(learningVersionId, 80),
       categoryId: null,
-      outcome, score: gate.score,
+      outcome, score: gate.score, scoreBasis: 'assessment-band',
+      ...(Number.isFinite(Number(candidate.preRankScore))
+        && Number(candidate.preRankScore) >= 0 && Number(candidate.preRankScore) <= 100
+        ? { discoveryScore: Number(candidate.preRankScore) }
+        : {}),
       reasons: reasons.map((reason) => boundedText(reason)).filter(Boolean).slice(0, REVIEW_REASON_LIMIT),
     };
     if (!gate.keep) {
@@ -2250,13 +2359,24 @@ function mergeTracker(
     const references = mergeSourceReferences(previous || {}, candidate);
     const urls = references.map((reference) => reference.url).filter(Boolean);
     const deterministicDimensions = Array.isArray(candidate.dimensions) ? candidate.dimensions : [];
+    const mergedAdvertFacts = mergeAdvertFacts(previous?.advertFacts, candidate.advertFacts);
     const generated = {
       id, company: candidate.company, role: candidate.role, location: candidate.location || previous?.location || '', score: gate.score,
-      scoreBreakdown: Object.fromEntries(deterministicDimensions
+      scoreBasis: 'assessment-band',
+      scoreBreakdown: {
+        'assessment-band': gate.assessmentBand,
+        'mandatory-adjustment': gate.score - gate.assessmentBand,
+      },
+      ...(Number.isFinite(Number(candidate.preRankScore))
+        && Number(candidate.preRankScore) >= 0 && Number(candidate.preRankScore) <= 100
+        ? { discoveryScore: Number(candidate.preRankScore) }
+        : {}),
+      discoveryBreakdown: Object.fromEntries(deterministicDimensions
         .filter((item) => item?.name && Number.isFinite(Number(item.score)))
         .map((item) => [item.name, Number(item.score)])),
       eligibility: { status: gate.eligibility, reasons: gate.reasons },
       mandatoryRequirements: assessment.mandatoryRequirements,
+      ...(mergedAdvertFacts ? { advertFacts: mergedAdvertFacts } : {}),
       status: previous?.status || 'new', category: previous?.category || null,
       tags: [...new Set([...(previous?.tags || []), ...(candidate.tags || []), ...(gate.eligibility === 'check' ? ['Check mandatory requirement'] : []), ...(changedAdvert ? ['Updated advert — review'] : [])])],
       sources: [...new Set([...(previous?.sources || []), ...urls])], sourceReferences: references,

@@ -16,7 +16,7 @@ import {
 } from './mutationCoordinator.mjs';
 import { coordinateScanArtifacts } from './scanPipeline.mjs';
 import {
-  acquireScanLease, currentLeaseOwner, releaseScanLease,
+  acquireScanLease, currentLeaseOwner, observeProcessOwner, releaseScanLease,
 } from './scanLease.mjs';
 import { appendRunEvent, openRunJournal, replayRunJournal } from './runJournal.mjs';
 import { runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe } from './scanMutationProjection.mjs';
@@ -73,6 +73,36 @@ function processExists(pid) {
   } catch (error) {
     return error?.code === 'EPERM';
   }
+}
+
+async function deadProcessOwner() {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore', windowsHide: true,
+  });
+  await new Promise((resolve, reject) => {
+    child.once('spawn', resolve);
+    child.once('error', reject);
+  });
+  const owner = observeProcessOwner(child.pid);
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  child.kill();
+  await exited;
+  return owner;
+}
+
+function writeStaleStartingGuard(root, lease, owner, phase) {
+  const directory = path.join(root, '.scout', 'mutation.guard');
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, 'owner.json'), `${JSON.stringify({
+    schemaVersion: 2,
+    coordinatorId: 'stale-coordinator',
+    leaseId: 'stale-lease',
+    fencingGeneration: lease.generation - 1,
+    owner,
+    childOperation: {
+      operationId: 'stale-child-operation', phase, state: 'starting', owner: null,
+    },
+  })}\n`);
 }
 
 function mutationInput(root) {
@@ -233,6 +263,38 @@ test('guard publication failure never exposes an unverifiable canonical director
   assert.equal(fs.existsSync(path.join(scout, 'mutation.guard')), false);
   assert.equal(fs.readdirSync(scout).some((name) => name.startsWith('mutation.guard.candidate.')), false);
   assert.equal(withMutationCoordinator(root, lease, () => 'recovered'), 'recovered');
+});
+
+test('a stale ls-files launch can be reclaimed after its owner exits', async () => {
+  const { root, lease } = fixture();
+  releaseScanLease(lease);
+  const successor = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'successor-run',
+  });
+  const owner = await deadProcessOwner();
+  writeStaleStartingGuard(root, successor, owner, 'ls-files');
+
+  assert.equal(withMutationCoordinator(root, successor, () => 'recovered'), 'recovered');
+  assert.equal(fs.readdirSync(path.join(root, '.scout'))
+    .some((name) => name.startsWith('mutation.guard.quarantine.')), true);
+  releaseScanLease(successor);
+});
+
+test('a stale mutating child launch remains blocked after its owner exits', async () => {
+  const { root, lease } = fixture();
+  releaseScanLease(lease);
+  const successor = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'successor-run',
+  });
+  const owner = await deadProcessOwner();
+  writeStaleStartingGuard(root, successor, owner, 'add');
+
+  assert.throws(
+    () => withMutationCoordinator(root, successor, () => assert.fail('stale add launch must stay fenced')),
+    /another workspace mutation is in progress/,
+  );
+  assert.equal(fs.existsSync(path.join(root, '.scout', 'mutation.guard')), true);
+  releaseScanLease(successor);
 });
 
 test('guard transitions reconcile a failure after canonical owner publication', () => {

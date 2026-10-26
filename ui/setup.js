@@ -258,6 +258,13 @@ export function shouldRequestRecoveryKey(status = {}, pendingRecoveryKey = null)
   return status.requestAccess === 'local' && status.sync?.enabled && !pendingRecoveryKey;
 }
 
+export function providerOnlyReadinessGap(status) {
+  const checks = status?.readiness;
+  return Boolean((status?.setupComplete || status?.established)
+    && checks && checks.provider === false
+    && ['preferences', 'evidence', 'approved', 'tracker'].every((key) => checks[key] === true));
+}
+
 export function scanOutcomeSummary(scanHealth = {}) {
   const reviewed = Number(scanHealth.candidatesFound || 0);
   const kept = Number(scanHealth.keepersAdded || 0);
@@ -728,7 +735,8 @@ const Setup = {
         : 'A private workspace, tuned to your search.';
       const proposalRunning = ['queued', 'running'].includes(this.operations.proposal?.status);
       const scanRunning = ['queued', 'running'].includes(this.operations.scan?.status);
-      if (!keepOpen && (proposalRunning || (this.proposal && !this.status.ready))) {
+      const providerOnlyGap = providerOnlyReadinessGap(this.status);
+      if (!keepOpen && (proposalRunning || (this.proposal && !this.status.ready && !providerOnlyGap))) {
         this.resumeAt(5);
         return;
       }
@@ -761,7 +769,7 @@ const Setup = {
         this.render();
         return;
       }
-      if (!keepOpen && this.status.setupComplete && !this.status.ready) {
+      if (!keepOpen && this.status.setupComplete && !this.status.ready && !providerOnlyGap) {
         this.resumeAt(5);
         this.setMessage('Scout setup needs attention before another scan can run.', 'error');
         return;

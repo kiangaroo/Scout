@@ -7,6 +7,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from './lib/mainModule.mjs';
 import { atomicWriteFile } from './lib/atomicWrite.mjs';
+import { addSpeculativeProspect } from './lib/speculativeProspects.mjs';
+import { registerJobImportRoutes } from './lib/jobImportService.mjs';
+import { loadCachedAdvertObservations, restoreAdvertFacts } from './lib/restoreAdvertFacts.mjs';
 import {
   PROFILE_PUBLICATION_RUN_PREFIX, publishProfileGeneration,
   recoverPendingProfilePublications,
@@ -33,8 +36,8 @@ import { scanEstimate } from './lib/scanEstimate.mjs';
 import { createProviderHealthMonitor, scheduleStatus, scheduleSummary } from './lib/scheduler.mjs';
 import { loadPortals, portalSummary } from './lib/ats.mjs';
 import { JOB_CATEGORIES } from './lib/filters.mjs';
-import { buildSourcePayload, sourceUrlOf, SourceCache } from './lib/source.mjs';
-import { fetchPublicResource, PublicHttpError } from './lib/publicHttp.mjs';
+import { fetchEntrySource, sourceUrlsOf, SourceCache } from './lib/source.mjs';
+import { fetchPublicResource } from './lib/publicHttp.mjs';
 import {
   assertSafeModel, detectProvidersAsync, providerLocalHealthSignal, runProviderCommand,
 } from './lib/providers.mjs';
@@ -96,7 +99,7 @@ import {
 } from './lib/feedbackLearning.mjs';
 import {
   loadWorkspaceConfig, migrateWorkspace, resolveWorkspaceRoot, seedWorkspace, syncManagedInstructions,
-  mutateWorkspaceConfig, mutateWorkspaceConfigAsync, workspacePaths,
+  mutateWorkspaceConfig, mutateWorkspaceConfigAsync, modelForProvider, workspacePaths,
 } from './lib/workspace.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -448,6 +451,11 @@ function publicLatestScan() {
     categoryId: item?.categoryId ? String(item.categoryId).slice(0, 80) : null,
     outcome: ['kept', 'hard_exclusion', 'mandatory_unmet', 'below_threshold', 'provider_discarded'].includes(item?.outcome) ? item.outcome : 'provider_discarded',
     score: Number.isFinite(Number(item?.score)) ? Number(item.score) : null,
+    ...(item?.scoreBasis === 'assessment-band' ? { scoreBasis: 'assessment-band' } : {}),
+    ...(typeof item?.discoveryScore === 'number'
+      && Number.isFinite(item.discoveryScore) && item.discoveryScore >= 0 && item.discoveryScore <= 100
+      ? { discoveryScore: item.discoveryScore }
+      : {}),
     reasons: (Array.isArray(item?.reasons) ? item.reasons : []).map((reason) => String(reason).slice(0, 220)).slice(0, 3),
   })).slice(0, 80) : [];
   const boundedContribution = (item) => typeof item === 'string' ? item.slice(0, 100) : ({ code: String(item?.code || '').slice(0, 100), score: Number.isFinite(Number(item?.score)) ? Number(item.score) : null });
@@ -475,6 +483,12 @@ function publicLatestScan() {
     }
     return projected;
   };
+  const publicAdvertCount = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 10_000
+    ? value
+    : null;
+  const advertsChecked = publicAdvertCount(run.adverts_checked);
+  const advertsUnverified = publicAdvertCount(run.adverts_unverified);
+  const advertsClosed = publicAdvertCount(run.adverts_closed);
   const boundedSelectionSummary = (value) => value && typeof value === 'object' ? Object.fromEntries(['selected', 'assessed', 'assessmentFailed'].filter((name) => Number.isFinite(Number(value[name]))).map((name) => [name, Number(value[name])])) : null;
   const boundedCoverageRow = (row) => ({
     value: String(row?.value || 'unknown').slice(0, 160),
@@ -528,6 +542,9 @@ function publicLatestScan() {
     profileId: run.profile_id ? String(run.profile_id).slice(0, 80) : null,
     discoveryEngine: run.discovery_engine ? String(run.discovery_engine).slice(0, 80) : null,
     funnel: boundedFunnel(run.funnel), selectionSummary: boundedSelectionSummary(run.selection_summary),
+    ...(advertsChecked === null ? {} : { advertsChecked }),
+    ...(advertsUnverified === null ? {} : { advertsUnverified }),
+    ...(advertsClosed === null ? {} : { advertsClosed }),
     coverage, explanations,
     automaticBroadened: run.mode === 'broadened', reviewed,
   };
@@ -551,6 +568,19 @@ function readScheduleSummary(config = loadWorkspaceConfig(WORKSPACE_ROOT), healt
 
 // Task 5 assigns handlers into this table: routes['POST /api/status'] = (req,res,body)=>{...}
 export const routes = {};
+
+export function resolveManualScanModel(config, provider, requestBody = {}) {
+  if (Object.prototype.hasOwnProperty.call(requestBody, 'model')) {
+    return assertSafeModel(requestBody.model);
+  }
+  return assertSafeModel(modelForProvider(config, provider));
+}
+
+export function queuedManualScanResult(result) {
+  return result?.status === 'queued'
+    ? { ok: true, status: 'queued', runId: result.runId || null }
+    : null;
+}
 
 function loopbackHost(hostHeader) {
   try {
@@ -1205,38 +1235,14 @@ async function handleSource(res, id) {
     return sendJson(res, 500, publicApiError('Tracker could not be read.'));
   }
   if (!entry) return sendJson(res, 404, { error: 'no such opportunity' });
-  const target = sourceUrlOf(entry);
-  if (!target) return sendJson(res, 404, { error: 'no usable source url' });
-  const cached = sourceCache.get(id);
+  const sources = sourceUrlsOf(entry);
+  if (!sources.length) return sendJson(res, 404, { error: 'no usable source url' });
+  const cacheKey = JSON.stringify([id, sources]);
+  const cached = sourceCache.get(cacheKey);
   if (cached) return sendJson(res, 200, cached);
-  let html;
-  try {
-    const r = await fetchPublicResource(target, {
-      timeoutMs: 10000,
-      maxBytes: 1_000_000,
-      maxRedirects: 4,
-      allowedContentTypes: ['text/html', 'application/xhtml+xml', 'application/xml', 'text/plain'],
-      headers: {
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
-        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
-    });
-    if (!r.ok) return sendJson(res, 502, { ok: false, error: `source returned ${r.status}` });
-    html = await r.text();
-  } catch (e) {
-    return sendJson(res, 502, {
-      ok: false,
-      ...(e instanceof PublicHttpError && e.reasonCode === 'request-timeout'
-        ? { error: 'Source request timed out.', reasonCode: 'source-timeout' }
-        : {
-          error: 'Source could not be fetched.',
-          reasonCode: e instanceof PublicHttpError ? e.reasonCode : 'source-fetch-failed',
-        }),
-    });
-  }
-  const payload = buildSourcePayload(html, target, new Date().toISOString());
-  sourceCache.set(id, payload);
-  return sendJson(res, 200, payload);
+  const { status, payload } = await fetchEntrySource(entry, { fetchResource: fetchPublicResource });
+  if (status === 200) sourceCache.set(cacheKey, payload);
+  return sendJson(res, status, payload);
 }
 
 export function createServer() {
@@ -2199,7 +2205,7 @@ routes['POST /api/sync/passphrase'] = async (req, res, body) => {
   } catch { return replyJson(res, 400, publicApiError('Recovery passphrase could not be changed.')); }
 };
 
-async function applyTrackerMutation(res, mutate, commitMessage, expectedRevision) {
+async function applyTrackerMutation(res, mutate, commitMessage, expectedRevision, responseDetails = () => ({})) {
   const lock = await acquireTrackerMutationLock(WORKSPACE_ROOT);
   if (!lock) return replyJson(res, 409, { conflict: true, error: 'A scan is updating the tracker. Scout did not overwrite it; try again shortly.' });
   try {
@@ -2208,6 +2214,7 @@ async function applyTrackerMutation(res, mutate, commitMessage, expectedRevision
     void scheduleCheckpoint(reason);
     return replyJson(res, 200, {
       ok: true, savedLocally: true, syncQueued: true, trackerRevision: result.revision,
+      ...responseDetails(),
     });
   } catch (e) {
     if (e instanceof TrackerRevisionConflictError) {
@@ -2225,6 +2232,29 @@ async function applyTrackerMutation(res, mutate, commitMessage, expectedRevision
 }
 
 function company(data, id) { try { return findEntry(data, id).company; } catch { return id; } }
+
+routes['POST /api/speculative'] = async (req, res, body) => {
+  const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
+  // Validate user input before taking the shared tracker authority. No source
+  // request, contact lookup or outreach occurs when a prospect is saved.
+  try { addSpeculativeProspect({ opportunities: [] }, b, today()); }
+  catch { return replyJson(res, 400, { error: 'Enter a bounded employer name, public HTTPS careers URL and reason for investigating. Do not include URL credentials or tracking parameters.' }); }
+  await applyTrackerMutation(res, (data) => addSpeculativeProspect(data, b, today()),
+    'ui: add employer prospect', b.trackerRevision);
+};
+
+routes['POST /api/advert-facts/restore'] = async (req, res, body) => {
+  const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
+  try {
+    const { observations, skippedRuns, scannedRuns } = loadCachedAdvertObservations(WORKSPACE_ROOT);
+    let restored = { updated: 0, matched: 0 };
+    await applyTrackerMutation(res, (data) => {
+      restored = restoreAdvertFacts(data, observations);
+      return restored.tracker;
+    }, 'ui: restore saved advert facts', b.trackerRevision,
+    () => ({ restoredJobs: restored.updated, matchedJobs: restored.matched, skippedRuns, scannedRuns }));
+  } catch { return replyJson(res, 400, { error: 'Saved advert evidence could not be restored. Existing jobs have been preserved.' }); }
+};
 
 routes['POST /api/status'] = async (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
@@ -2653,7 +2683,7 @@ routes['POST /api/scan'] = (req, res, body) => {
   const config = loadWorkspaceConfig(WORKSPACE_ROOT);
   const provider = b.provider || config.ai?.provider;
   let model;
-  try { model = assertSafeModel(b.model); } catch { return replyJson(res, 400, { error: 'model is invalid' }); }
+  try { model = resolveManualScanModel(config, provider, b); } catch { return replyJson(res, 400, { error: 'model is invalid' }); }
   if (!['codex', 'claude'].includes(provider)) return replyJson(res, 400, { error: 'choose an authenticated AI provider first' });
   try {
     const estimate = scanEstimate(readScanRecords(), provider, 'primary');
@@ -2671,6 +2701,8 @@ routes['POST /api/scan'] = (req, res, body) => {
           runId: result.runId || null,
         };
       }
+      const queuedResult = queuedManualScanResult(result);
+      if (queuedResult) return queuedResult;
       if (!result.ok) throw new Error(result.error || `scan ended with ${result.status}`);
       const scanHealth = readScanHealth();
       return {
@@ -2795,6 +2827,7 @@ routes['POST /api/shutdown'] = (req, res) => {
   }, 200);
 };
 
+registerJobImportRoutes({ routes, operations, repoRoot: WORKSPACE_ROOT, onCheckpoint: scheduleCheckpoint });
 registerCompanyRoutes({ routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint: scheduleCheckpoint });
 const chatRuntime = registerChatRoutes({
   routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint: scheduleCheckpoint,

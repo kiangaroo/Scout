@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { normaliseIdentityText } from './jobIdentity.mjs';
 import { serializeTracker } from './tracker.mjs';
 import { queryAddressedUrlIdentityDigest } from './vacancyObservation.mjs';
+import { mergeAdvertFacts, sanitizeAdvertFacts } from './advertFacts.mjs';
 
 const RECIPE_VERSION = 1;
 const SAFE_CODE = /^[a-z0-9]+(?:[-_:][a-z0-9]+)*$/;
@@ -223,11 +224,20 @@ function safeOpportunity(entry, existed, prior = null) {
     .map(([name, value]) => [code(name), number(value, null)])
     .filter(([name, value]) => name && value !== null)
     .slice(0, 16));
+  const discoveryScore = number(entry?.discoveryScore, null);
+  const discoveryBreakdown = Object.fromEntries(Object.entries(entry?.discoveryBreakdown || {})
+    .map(([name, value]) => [code(name), number(value, null)])
+    .filter(([name, value]) => name && value !== null)
+    .slice(0, 16));
   const requirementChecks = (entry?.mandatoryRequirements || []).map((requirement) => ({
     id: identifier(requirement?.advertEvidenceId),
     status: code(requirement?.status, 'unknown'),
   })).filter((requirement) => requirement.id).slice(0, 24);
   const eligibility = code(entry?.eligibility?.status, 'below-threshold');
+  const projectedAdvertFacts = mergeAdvertFacts(
+    sanitizeAdvertFacts(prior?.advertFacts),
+    sanitizeAdvertFacts(entry?.advertFacts),
+  );
   return {
     id,
     company: boundedLabel(entry?.company, 120),
@@ -235,6 +245,9 @@ function safeOpportunity(entry, existed, prior = null) {
     location: boundedLabel(entry?.location, 160) || '',
     score: number(entry?.score, 0),
     scoreBreakdown,
+    ...(entry?.scoreBasis === 'assessment-band' ? { scoreBasis: 'assessment-band' } : {}),
+    ...(discoveryScore !== null && discoveryScore >= 0 && discoveryScore <= 100 ? { discoveryScore } : {}),
+    ...(entry?.discoveryBreakdown && typeof entry.discoveryBreakdown === 'object' ? { discoveryBreakdown } : {}),
     eligibility: {
       status: eligibility,
       reasonCodes: requirementChecks
@@ -242,6 +255,7 @@ function safeOpportunity(entry, existed, prior = null) {
         .map((item) => `mandatory-${item.status}`)
         .slice(0, 8),
     },
+    ...(projectedAdvertFacts ? { advertFacts: projectedAdvertFacts } : {}),
     requirementChecks,
     status: SAFE_STATUS.has(entry?.status) ? entry.status : 'new',
     category: code(entry?.category),
@@ -388,6 +402,9 @@ function safeRunRecord(record) {
       categoryId: code(item?.categoryId),
       outcome: SAFE_OUTCOME.has(item?.outcome) ? item.outcome : 'below_threshold',
       score: number(item?.score),
+      ...(item?.scoreBasis === 'assessment-band' ? { scoreBasis: 'assessment-band' } : {}),
+      ...(Number.isFinite(Number(item?.discoveryScore)) && Number(item.discoveryScore) >= 0 && Number(item.discoveryScore) <= 100
+        ? { discoveryScore: Number(item.discoveryScore) } : {}),
       reasonCodes: item?.outcome === 'provider_discarded'
         ? ['provider-discarded']
         : item?.outcome === 'below_threshold' ? ['below-threshold'] : [],
@@ -470,13 +487,23 @@ function canonicalTrackerRecipe(recipe) {
       role: boundedLabel(item?.role, 160),
       location: boundedLabel(item?.location, 160) || '',
       score: number(item?.score),
+      ...(item?.scoreBasis === 'assessment-band' ? { scoreBasis: 'assessment-band' } : {}),
+      ...(Number.isFinite(Number(item?.discoveryScore)) && Number(item.discoveryScore) >= 0 && Number(item.discoveryScore) <= 100
+        ? { discoveryScore: Number(item.discoveryScore) } : {}),
       scoreBreakdown: Object.fromEntries(Object.entries(item?.scoreBreakdown || {})
         .map(([key, value]) => [code(key), number(value, null)])
         .filter(([key, value]) => key && value !== null)),
+      ...(item?.discoveryBreakdown && typeof item.discoveryBreakdown === 'object' ? {
+        discoveryBreakdown: Object.fromEntries(Object.entries(item.discoveryBreakdown)
+          .map(([key, value]) => [code(key), number(value, null)])
+          .filter(([key, value]) => key && value !== null).slice(0, 16)),
+      } : {}),
       eligibility: {
         status: code(item?.eligibility?.status, 'below-threshold'),
         reasonCodes: (item?.eligibility?.reasonCodes || []).map((value) => code(value)).filter(Boolean).slice(0, 8),
       },
+      ...(sanitizeAdvertFacts(item?.advertFacts)
+        ? { advertFacts: sanitizeAdvertFacts(item.advertFacts) } : {}),
       requirementChecks: (item?.requirementChecks || []).map((check) => ({
         id: identifier(check?.id),
         status: code(check?.status, 'unknown'),
@@ -534,7 +561,11 @@ function renderTracker(currentContent, recipe) {
       location: upsert.location,
       score: upsert.score,
       scoreBreakdown: upsert.scoreBreakdown,
+      ...(upsert.scoreBasis ? { scoreBasis: upsert.scoreBasis } : {}),
+      ...(upsert.discoveryScore !== undefined ? { discoveryScore: upsert.discoveryScore } : {}),
+      ...(upsert.discoveryBreakdown !== undefined ? { discoveryBreakdown: upsert.discoveryBreakdown } : {}),
       eligibility: { status: upsert.eligibility.status, reasons: upsert.eligibility.reasonCodes },
+      ...(upsert.advertFacts ? { advertFacts: upsert.advertFacts } : {}),
       mandatoryRequirements: requirementChecks,
       status: upsert.status,
       category: upsert.category,

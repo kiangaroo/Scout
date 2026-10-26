@@ -149,12 +149,76 @@ export function buildSourcePayload(html, url, fetchedAt) {
 }
 
 export function sourceUrlOf(entry) {
-  const raw = entry && Array.isArray(entry.sources) ? entry.sources[0] : null;
-  if (!raw) return null;
-  try {
-    const u = new URL(String(raw));
-    return (u.protocol === 'http:' || u.protocol === 'https:') ? u.href : null;
-  } catch { return null; }
+  return sourceUrlsOf(entry)[0] || null;
+}
+
+export function sourceUrlsOf(entry) {
+  const sources = entry && Array.isArray(entry.sources) ? entry.sources : [];
+  const urls = [];
+  const seen = new Set();
+  for (const source of sources) {
+    if (urls.length >= 3) break;
+    try {
+      const url = new URL(String(source || '').trim());
+      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) continue;
+      if (seen.has(url.href)) continue;
+      seen.add(url.href);
+      urls.push(url.href);
+    } catch { /* skip unusable saved URLs */ }
+  }
+  return urls;
+}
+
+const SOURCE_FETCH_OPTIONS = Object.freeze({
+  timeoutMs: 10000,
+  maxBytes: 1_000_000,
+  maxRedirects: 4,
+  allowedContentTypes: ['text/html', 'application/xhtml+xml', 'application/xml', 'text/plain'],
+  headers: {
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  },
+});
+
+function sourceFetchFailure(error) {
+  if (error?.reasonCode === 'request-timeout') {
+    return { error: 'Source request timed out.', reasonCode: 'source-timeout' };
+  }
+  const reasonCode = typeof error?.reasonCode === 'string' && /^[a-z0-9-]{1,64}$/.test(error.reasonCode)
+    ? error.reasonCode : 'source-fetch-failed';
+  return { error: 'Source could not be fetched.', reasonCode };
+}
+
+export async function fetchEntrySource(entry, {
+  fetchResource,
+  now = () => new Date().toISOString(),
+} = {}) {
+  const urls = sourceUrlsOf(entry);
+  if (!urls.length) return { status: 404, payload: { error: 'no usable source url' } };
+  if (typeof fetchResource !== 'function') throw new TypeError('fetchResource is required');
+
+  let firstFailure = null;
+  for (let index = 0; index < urls.length; index += 1) {
+    const url = urls[index];
+    try {
+      const response = await fetchResource(url, SOURCE_FETCH_OPTIONS);
+      if (!response?.ok) {
+        firstFailure ||= { error: `source returned ${response?.status || ''}`.trim() };
+        continue;
+      }
+      const html = await response.text();
+      return {
+        status: 200,
+        payload: {
+          ...buildSourcePayload(html, url, now()),
+          fallbackUsed: index > 0,
+        },
+      };
+    } catch (error) {
+      firstFailure ||= sourceFetchFailure(error);
+    }
+  }
+  return { status: 502, payload: { ok: false, ...firstFailure } };
 }
 
 export class SourceCache {

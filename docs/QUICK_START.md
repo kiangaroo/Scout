@@ -60,7 +60,7 @@ In a source checkout, `node tools/scout.mjs doctor` is equivalent. A globally
 available `scout` command is only present when the package has been linked or
 installed separately.
 
-See [Providers](PROVIDERS.md) if detection or authentication fails.
+See [Providers](PROVIDERS.md) if detection or authentication fails. A provider outage does not erase your saved profile or CV. For an established workspace, open **Settings → AI provider** to restore the configured provider; do not regenerate the profile solely because a provider is unavailable.
 
 ## 4. Add your CV and preferences
 
@@ -142,6 +142,48 @@ If the supervised primary scan keeps zero roles, Scout automatically performs on
 New opportunities land in the **Jobs** tab, highest score first, each carrying a colour tag for its search category. Choose **Yes, shortlist** to move a role to the **Shortlist** tab, or **No** to dismiss it; dismissing shows a brief **Undo** toast that restores the role to Jobs. Tap a card to expand its full detail, including the original advert. From the **Shortlist** tab, **Remove** dismisses a role the same way (with undo), and **Review CV options** starts the same CV options flow described above; marking a shortlisted role as applied moves it to the **Pipeline** tab. Dismissed and applied roles remain visible in the **All** tab and are never re-surfaced by a later scan.
 
 The **All** tab is a searchable table. On a phone, swipe the labelled table region horizontally to reach commute, stage, status and last-checked columns; filtering keeps the text cursor and in-progress keyboard composition in place.
+
+### Understand missing advert details
+
+Expand a job to see **Advert facts and checks**. Scout retains bounded structured salary, working pattern, contract, full/part-time and explicit office-day facts when available. Estimated salaries remain labelled estimates. Hybrid does not establish office days; gross salary does not establish take-home pay. Missing facts remain unknown and cannot satisfy mandatory requirements.
+
+For older saved jobs, select **Restore facts from saved scans**. This repairs matching jobs from retained scan artifacts without another source request or AI call. It preserves status, scores, notes, contacts, commute and application history. The evidence date is the original capture date, not a fresh availability check. Old or unreadable evidence may be unavailable. Use **show what the source says** and the original advert for remaining gaps; blocked pages are not bypassed.
+
+### Add a job you found elsewhere
+
+In **Jobs**, select **Add job from URL**, paste the public vacancy link, and choose **Import and score**. Scout uses your configured AI provider and existing allowance to extract the listing and assess it against your current profile and CV. No additional account or key is required.
+
+The imported vacancy has the same shortlist, research, CV, cover-letter and interview tools as discovered jobs. A low assessment or a mismatch remains visible for your review; adding a job does not change your preferences or make unknown requirements pass. An existing job opens without overwriting your decisions or application history.
+
+Some sites block automated access or require sign-in. If Scout cannot read a usable advert, it offers a text fallback: paste the advert alongside its public URL and retry. Scout labels pasted evidence and unverified availability. Use a single vacancy page rather than a search-results page. No application or employer message is sent.
+
+### Research an application approach
+
+If Scout is briefly finishing startup or backup work, research waits before starting the AI turn. If the workspace stays busy, retry after the update or scan completes. Closing or stopping a waiting request cancels it. A retry does not repeat an AI turn that has already started.
+
+1. Expand a job and select **research my application approach**. This opens the existing job chat with a prepared request; opening it does not call a model.
+2. Choose an available provider/model and send when ready. Research uses your existing provider allowance. No additional research account or API key is required.
+3. Review the recommended route and up to two worthwhile alternatives: evidence links and dates, confirmed facts versus inference, employer restrictions, material to reuse, estimated preparation time and unresolved questions. A normal application may be the best route. Ideas default to 30 minutes or less of your preparation time; AI runtime is not promised.
+4. Reopen the job chat and expand **View application plan** to read the saved plan. **research / refresh plan** prepares a new research request; **draft a chosen idea** prepares a separate conversation asking which idea you choose. Review and send either request yourself. Creating a plan never automatically creates application materials or sends anything.
+
+Plans are stored separately for each opportunity at `applications/<opportunity-id>/application-approach.md`. Successful research replaces that role's saved plan; failed, empty or oversized responses preserve its previous plan. Research providers can read and search but cannot edit workspace files through their research tools; Scout saves the returned plan atomically. Sources may still be blocked or unavailable and must be labelled unverified. Check employer recruitment and AI-use policies before using a proposed idea.
+
+### When an advert link fails
+
+Expand the job and open **source**. All saved source links are listed; the text preview tries up to three saved links in order. It labels a successful alternative and reports HTTP errors and timeouts separately from other fetch failures. Close and reopen a failed preview to retry.
+
+Use **Search for this job** to open Google with only the public employer and job title. Scout does not search automatically or send your CV, profile or notes. Compare the employer, location, closing date and job reference before trusting another result: reposts may be old or refer to a different vacancy. A blocked source does not prove a job is closed. Scout does not bypass access controls or automatically replace source links with search results.
+
+### Use Speculative for employer prospects
+
+**Speculative** holds researched employers you might approach even when no suitable vacancy is confirmed. Ordinary vacancy scans do not automatically generate these prospects.
+
+1. Open **Speculative → Add employer prospect**.
+2. Enter the employer, its official public HTTPS careers or organisation URL, work to explore and your evidence-based reason for investigating. Include unresolved questions in the notes.
+3. Save the prospect. It has no fit score, verified vacancy, salary or working arrangement. Research those before making a decision.
+4. Shortlist, add notes and contacts, or prepare a draft using the normal opportunity tools. Check whether the employer accepts speculative enquiries; a jobs page alone does not establish that. Send any chosen outreach yourself.
+
+To monitor advertised vacancies automatically, configure the employer separately in **Settings → Employers**, review access terms and robots permission, and supply a supported public ATS board or careers URL. Login-protected or JavaScript-only pages may need manual checking. Adding a prospect does not enable crawling or register for job alerts.
 
 ## 7. Enable daily scans (optional)
 
