@@ -2,6 +2,8 @@
 
 ## Fixed
 
+- An unavailable AI provider no longer reopens profile generation for a completed workspace whose saved evidence and approval remain ready. Restore the configured provider in Settings; browsing existing jobs remains available.
+
 - Add a public vacancy URL directly from Jobs, assess it against the current profile, and use the ordinary job tools. Duplicate imports preserve existing records; blocked pages offer an explicit advert-text fallback, and low-fit user imports remain available for review.
 
 - Research waits briefly for startup or backup workspace updates before starting one AI turn. Persistent contention is reported as workspace busy. Research receives bounded selected-job and career evidence instead of rereading the full tracker; output limits remain unchanged.

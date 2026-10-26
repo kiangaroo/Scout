@@ -60,7 +60,7 @@ In a source checkout, `node tools/scout.mjs doctor` is equivalent. A globally
 available `scout` command is only present when the package has been linked or
 installed separately.
 
-See [Providers](PROVIDERS.md) if detection or authentication fails.
+See [Providers](PROVIDERS.md) if detection or authentication fails. A provider outage does not erase your saved profile or CV. For an established workspace, open **Settings → AI provider** to restore the configured provider; do not regenerate the profile solely because a provider is unavailable.
 
 ## 4. Add your CV and preferences
 

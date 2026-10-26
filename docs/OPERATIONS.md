@@ -232,6 +232,8 @@ Pushing or merging a branch does not by itself update the live VPS.
 
 ## Maintenance contract
 
+Completed-workspace setup routing separates provider availability from saved profile readiness. A provider-only failure must not auto-open proposal generation or reinterpret an approved published profile as missing. Actual missing evidence/approval and active proposal recovery retain their existing guards.
+
 Manual vacancy import accepts one public listing URL and uses the existing public-resource boundary, bounded structured provider calls and assessment bands. Pasted advert text is an explicit fallback, not verified live content. Imported records use normal vacancy tools; manual selection never overrides profile evidence or mandatory-requirement uncertainty. Duplicate detection precedes publication, preserves existing history, and publication uses shared tracker mutation authority and backup. No automatic outreach or application follows import.
 
 Application research retries brief workspace contention only before a provider turn is created, under a bounded wait with cancellation and shutdown tracking. No foreign lease is cleared and no started provider turn is retried. The research prompt contains bounded profile/CV/config evidence plus the selected opportunity, and forbids broad tracker/cache dumps. Existing provider output-size limits remain in force.
